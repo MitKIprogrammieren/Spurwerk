@@ -445,7 +445,6 @@ configs:
           threading.Thread(target=arbeiter, daemon=True).start()
           print(f"Spurwerk-Server auf Port {PORT}, Valhalla {VALHALLA}", flush=True)
           ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
-
   seite:
     content: |
       <!DOCTYPE html>
@@ -454,7 +453,7 @@ configs:
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
       <title>Spurwerk</title>
-      <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+      <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
       <style>
       :root{--bg:#1b1d22;--panel:#26282d;--panel2:#2f3238;--ink:#f1efe8;--mute:#b4b2a9;--dim:#888780;--line:#3a3d44;
       --auto:#1D9E75;--autoH:#5DCAA5;--fuss:#7F77DD;--fussH:#AFA9EC;--rad:#D85A30;--radH:#F0997B}
@@ -503,9 +502,11 @@ configs:
       .marke.w{color:#FAC775}.marke.f{color:#F09595}
       .mehr{display:block;margin:14px auto;padding:10px 18px;border-radius:999px;background:var(--panel2)}
       .leer{color:var(--dim);text-align:center;padding:40px 10px}
-      .leaflet-container{background:var(--bg);font:inherit}
-      .leaflet-tile-pane{filter:invert(1) hue-rotate(180deg) brightness(.8) contrast(.95) saturate(.3)}
-      .leaflet-control-attribution{background:rgba(0,0,0,.5)!important;color:#999!important}.leaflet-control-attribution a{color:#bbb!important}
+      .maplibregl-ctrl-attrib{background:rgba(0,0,0,.55)!important;color:#aaa!important;font-size:11px}.maplibregl-ctrl-attrib a{color:#ccc!important}
+      #stilWahl{top:12px;right:56px;padding:4px;border-radius:999px;display:flex;gap:2px}
+      #stilWahl button{padding:6px 11px;border-radius:999px;font-size:13px;color:var(--mute)}
+      #stilWahl button.an{background:var(--ink);color:#111}
+      @media(max-width:700px){#stilWahl{top:auto;bottom:150px;right:8px;flex-direction:column}}
       @media(max-width:700px){#zeitText{min-width:0;flex:1}.zeit{margin-left:0;width:100%}#summe{left:8px;right:8px;bottom:8px}}
       </style>
       </head>
@@ -527,10 +528,13 @@ configs:
         <div class="schwebe" id="artFilter">
           <button data-art="" class="an">Alle</button><button data-art="auto">Auto</button><button data-art="fuss">Fuß</button><button data-art="rad">Rad</button>
         </div>
+        <div class="schwebe" id="stilWahl">
+          <button data-stil="spurwerk">Spurwerk</button><button data-stil="schwarz">Schwarz</button><button data-stil="hell">Hell</button><button data-stil="bunt">Bunt</button>
+        </div>
         <div class="schwebe" id="summe"><div class="kacheln" id="kacheln"></div><div id="stand"></div></div>
         <div id="liste"><div class="listeInnen" id="listeInnen"></div></div>
       </main>
-      <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+      <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
       <script>
       {
       const $$ = (id) => document.getElementById(id);
@@ -577,13 +581,79 @@ configs:
       const abfrage = () => { const z = zeitraum(); return `von=$${z.von}&bis=$${z.bis}&art=$${art}`; };
 
       // ------------------------------------------------ Karte
-      const karte = L.map("karte", { preferCanvas: true, zoomControl: false }).setView([52.43, 13.48], 12);
-      L.control.zoom({ position: "topright" }).addTo(karte);
-      L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        maxZoom: 19, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-      }).addTo(karte);
-      const renderer = L.canvas({ padding: 0.3 });
-      let schicht = L.layerGroup().addTo(karte), linien = [], ladeNr = 0;
+      const OFM = "https://tiles.openfreemap.org";
+      const PALETTE = {
+        spurwerk: { bg: "#131519", park: "#16201a", wasser: "#18222d", bau: "#1a1c21", klein: "#24272d", mittel: "#353941", gross: "#4a4f58", text: "#7c7f86", ort: "#5f636b" },
+        schwarz:  { bg: "#090909", park: "#0f120f", wasser: "#171c20", bau: "#121212", klein: "#1b1b1b", mittel: "#2b2b2b", gross: "#3d3d3d", text: "#707070", ort: "#585858" },
+      };
+      const breite = (a, b) => ["interpolate", ["exponential", 1.5], ["zoom"], 10, a, 18, b];
+      const NAME_DE = ["coalesce", ["get", "name:de"], ["get", "name"]];
+      function eigenerStil(f) {
+        return {
+          version: 8, glyphs: OFM + "/fonts/{fontstack}/{range}.pbf",
+          sources: { omt: { type: "vector", url: OFM + "/planet" } },
+          layers: [
+            { id: "bg", type: "background", paint: { "background-color": f.bg } },
+            { id: "gruen", type: "fill", source: "omt", "source-layer": "landcover", filter: ["in", ["get", "class"], ["literal", ["wood", "grass"]]], paint: { "fill-color": f.park, "fill-opacity": 0.7 } },
+            { id: "park", type: "fill", source: "omt", "source-layer": "park", paint: { "fill-color": f.park } },
+            { id: "wasser", type: "fill", source: "omt", "source-layer": "water", paint: { "fill-color": f.wasser } },
+            { id: "fluss", type: "line", source: "omt", "source-layer": "waterway", paint: { "line-color": f.wasser, "line-width": breite(0.5, 4) } },
+            { id: "bau", type: "fill", source: "omt", "source-layer": "building", minzoom: 14, paint: { "fill-color": f.bau } },
+            { id: "weg-klein", type: "line", source: "omt", "source-layer": "transportation", minzoom: 12,
+              filter: ["in", ["get", "class"], ["literal", ["minor", "service", "path", "track", "pedestrian"]]],
+              layout: { "line-cap": "round", "line-join": "round" }, paint: { "line-color": f.klein, "line-width": breite(0.4, 6) } },
+            { id: "weg-mittel", type: "line", source: "omt", "source-layer": "transportation",
+              filter: ["in", ["get", "class"], ["literal", ["secondary", "tertiary"]]],
+              layout: { "line-cap": "round", "line-join": "round" }, paint: { "line-color": f.mittel, "line-width": breite(0.6, 10) } },
+            { id: "weg-gross", type: "line", source: "omt", "source-layer": "transportation",
+              filter: ["in", ["get", "class"], ["literal", ["motorway", "trunk", "primary"]]],
+              layout: { "line-cap": "round", "line-join": "round" }, paint: { "line-color": f.gross, "line-width": breite(0.8, 14) } },
+            { id: "strassenname", type: "symbol", source: "omt", "source-layer": "transportation_name", minzoom: 14,
+              layout: { "symbol-placement": "line", "text-field": NAME_DE, "text-font": ["Noto Sans Regular"], "text-size": 11 },
+              paint: { "text-color": f.text, "text-halo-color": f.bg, "text-halo-width": 1.2 } },
+            { id: "ort", type: "symbol", source: "omt", "source-layer": "place",
+              filter: ["in", ["get", "class"], ["literal", ["city", "town", "suburb", "village", "quarter"]]],
+              layout: { "text-field": NAME_DE, "text-font": ["Noto Sans Regular"], "text-transform": "uppercase", "text-letter-spacing": 0.08,
+                        "text-size": ["match", ["get", "class"], "city", 15, "town", 13, 11] },
+              paint: { "text-color": f.ort, "text-halo-color": f.bg, "text-halo-width": 1.5 } },
+          ],
+        };
+      }
+      const STILE = {
+        spurwerk: () => eigenerStil(PALETTE.spurwerk),
+        schwarz: () => eigenerStil(PALETTE.schwarz),
+        hell: () => OFM + "/styles/positron",
+        bunt: () => OFM + "/styles/liberty",
+      };
+      let stil = merk("sw-stil", "spurwerk"); if (!STILE[stil]) stil = "spurwerk";
+
+      const karte = new maplibregl.Map({ container: "karte", style: STILE[stil](), center: [13.48, 52.43], zoom: 11.5, attributionControl: false });
+      karte.addControl(new maplibregl.AttributionControl({ compact: true, customAttribution: '© <a href="https://openfreemap.org">OpenFreeMap</a> · © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' }));
+      karte.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
+
+      let daten = { type: "FeatureCollection", features: [] }, ladeNr = 0, grenzenAlt = null;
+      const FARB_AUSDRUCK = (i) => ["match", ["get", "a"], "fuss", FARBE.fuss[i], "rad", FARBE.rad[i], FARBE.auto[i]];
+
+      function spurenEinrichten() {
+        if (!karte.getSource("spuren")) karte.addSource("spuren", { type: "geojson", data: daten });
+        const fertig = ["==", ["get", "f"], 1];
+        const schicht = (def) => { if (!karte.getLayer(def.id)) karte.addLayer(def); };
+        schicht({ id: "schein", type: "line", source: "spuren", layout: { "line-cap": "round", "line-join": "round" },
+          paint: { "line-color": FARB_AUSDRUCK(0), "line-width": 11, "line-blur": 7,
+                   "line-opacity": ["case", fertig, ["case", ["==", ["get", "x"], 1], 0.18, 0.45], 0.15] } });
+        schicht({ id: "kern", type: "line", source: "spuren", filter: fertig, layout: { "line-cap": "round", "line-join": "round" },
+          paint: { "line-color": FARB_AUSDRUCK(1), "line-width": 3, "line-opacity": ["case", ["==", ["get", "x"], 1], 0.5, 0.95] } });
+        schicht({ id: "roh", type: "line", source: "spuren", filter: ["!", fertig],
+          paint: { "line-color": FARB_AUSDRUCK(1), "line-width": 2, "line-opacity": 0.6, "line-dasharray": [2, 2.5] } });
+        schicht({ id: "gewaehlt", type: "line", source: "spuren", filter: ["==", ["get", "id"], gewaehlt || ""],
+          layout: { "line-cap": "round", "line-join": "round" }, paint: { "line-color": "#ffffff", "line-width": 5 } });
+      }
+      karte.on("style.load", spurenEinrichten);
+      for (const s of ["kern", "roh"]) {
+        karte.on("click", s, (e) => waehle(e.features[0].properties.id));
+        karte.on("mouseenter", s, () => (karte.getCanvas().style.cursor = "pointer"));
+        karte.on("mouseleave", s, () => (karte.getCanvas().style.cursor = ""));
+      }
 
       function dekodiere(s) {
         let i = 0, lat = 0, lon = 0; const out = [];
@@ -594,7 +664,7 @@ configs:
             const v = r & 1 ? ~(r >> 1) : r >> 1;
             if (k === 0) lat += v; else lon += v;
           }
-          out.push([lat / 1e5, lon / 1e5]);
+          out.push([lon / 1e5, lat / 1e5]);
         }
         return out;
       }
@@ -604,27 +674,38 @@ configs:
         let d;
         try { d = await api(`/api/linien?$${abfrage()}&grob=$${grob ? 1 : 0}`); } catch (e) { $$("stand").textContent = e.message; return; }
         if (nr !== ladeNr) return;
-        schicht.clearLayers(); linien = [];
-        const grenzen = L.latLngBounds([]);
+        const grenzen = new maplibregl.LngLatBounds();
+        daten = { type: "FeatureCollection", features: [] };
         for (const l of d.linien) {
           const p = dekodiere(l.s); if (p.length < 2) continue;
-          const [f, h] = FARBE[l.a] || FARBE.auto, sel = gewaehlt === l.id;
-          const schein = L.polyline(p, { renderer, color: f, weight: sel ? 16 : 10, opacity: l.f ? (l.x ? 0.12 : 0.25) : 0.1, interactive: false });
-          const kern = L.polyline(p, { renderer, color: sel ? "#fff" : h, weight: sel ? 5 : (l.f ? 3 : 2), opacity: l.f ? (l.x ? 0.55 : 0.95) : 0.6, dashArray: l.f ? null : "5 6" });
-          kern.on("click", () => waehle(l.id));
-          schein.addTo(schicht); kern.addTo(schicht);
-          linien.push({ id: l.id, kern }); grenzen.extend(kern.getBounds());
+          daten.features.push({ type: "Feature", properties: { id: l.id, a: l.a, f: l.f, x: l.x }, geometry: { type: "LineString", coordinates: p } });
+          for (const q of p) grenzen.extend(q);
         }
-        if (zoomen && grenzen.isValid()) karte.fitBounds(grenzen, { padding: [40, 40], maxZoom: 15 });
+        grenzenAlt = grenzen.isEmpty() ? null : grenzen;
+        const quelle = karte.getSource("spuren");
+        if (quelle) quelle.setData(daten);
+        if (zoomen && grenzenAlt) karte.fitBounds(grenzenAlt, { padding: 60, maxZoom: 15, duration: 600 });
       }
 
       function waehle(id) {
         gewaehlt = gewaehlt === id ? null : id;
-        ladeKarte(false).then(() => {
-          const l = linien.find((x) => x.id === gewaehlt);
-          if (l) karte.fitBounds(l.kern.getBounds(), { padding: [60, 60], maxZoom: 16 });
-        });
+        if (karte.getLayer("gewaehlt")) karte.setFilter("gewaehlt", ["==", ["get", "id"], gewaehlt || ""]);
+        const f = daten.features.find((x) => x.properties.id === gewaehlt);
+        if (f) {
+          const b = new maplibregl.LngLatBounds();
+          for (const q of f.geometry.coordinates) b.extend(q);
+          karte.fitBounds(b, { padding: 80, maxZoom: 16, duration: 600 });
+        }
       }
+
+      function zeigeStil() {
+        document.querySelectorAll("[data-stil]").forEach((b) => b.classList.toggle("an", b.dataset.stil === stil));
+      }
+      document.querySelectorAll("[data-stil]").forEach((b) => b.onclick = () => {
+        stil = b.dataset.stil; sichere("sw-stil", stil); zeigeStil();
+        karte.setStyle(STILE[stil]());   // „style.load“ legt die Strecken wieder darüber
+      });
+      zeigeStil();
 
       // ------------------------------------------------ Summen
       async function ladeSummen() {
@@ -666,7 +747,9 @@ configs:
       $$("listeInnen").addEventListener("click", (ev) => {
         if (ev.target.closest(".mehr")) return ladeListe(false);
         const z = ev.target.closest(".zeile"); if (!z) return;
-        zeigeAnsicht("karte"); gewaehlt = null; waehle(z.dataset.id);
+        zeigeAnsicht("karte"); gewaehlt = null;
+        const id = z.dataset.id;
+        setTimeout(() => waehle(id), 50);
       });
 
       // ------------------------------------------------ Bedienung
@@ -674,9 +757,9 @@ configs:
         ansicht = a; sichere("sw-ansicht", a);
         document.querySelectorAll("[data-ansicht]").forEach((b) => b.classList.toggle("an", b.dataset.ansicht === a));
         const k = a === "karte";
-        $$("karte").style.display = $$("artFilter").style.display = $$("summe").style.display = k ? "" : "none";
+        $$("karte").style.display = $$("artFilter").style.display = $$("summe").style.display = $$("stilWahl").style.display = k ? "" : "none";
         $$("liste").style.display = k ? "none" : "block";
-        if (k) setTimeout(() => karte.invalidateSize(), 0);
+        if (k) setTimeout(() => karte.resize(), 0);
         else ladeListe(true);
       }
       function alles(zoomen = true) {
@@ -687,6 +770,7 @@ configs:
         document.querySelectorAll("[data-spanne]").forEach((b) => b.classList.toggle("an", b.dataset.spanne === spanne));
         document.querySelectorAll("[data-art]").forEach((b) => b.classList.toggle("an", b.dataset.art === art));
         gewaehlt = null;
+        if (karte.getLayer("gewaehlt")) karte.setFilter("gewaehlt", ["==", ["get", "id"], ""]);
         ladeKarte(zoomen); ladeSummen(); ladeStand();
         if (ansicht === "strecken") ladeListe(true);
       }
@@ -705,4 +789,3 @@ configs:
       </script>
       </body>
       </html>
-
