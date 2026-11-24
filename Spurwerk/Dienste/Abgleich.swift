@@ -43,14 +43,25 @@ final class Abgleich: ObservableObject {
         }
     }
 
+    /// Wird bei jeder gespeicherten Änderung hochgezählt – die Karte lädt dann nach.
+    @Published private(set) var version = 0
+
+    func geaendert() { version &+= 1 }
+
     func ausstehendeAbgleichen(container: ModelContainer, auchFehler: Bool = false) async {
         guard !laeuft else { return }
         laeuft = true
-        defer { laeuft = false }
+        defer { laeuft = false; geaendert() }
 
         let context = container.mainContext
-        let alle = (try? context.fetch(FetchDescriptor<Fahrt>())) ?? []
-        let offen = alle.filter { $0.status == .wartet || (auchFehler && $0.status == .fehler) }
+        // Nur offene Strecken holen – nicht den ganzen Bestand
+        let wartet = FetchDescriptor<Fahrt>(predicate: #Predicate { $0.statusText == "wartet" },
+                                            sortBy: [SortDescriptor(\.start, order: .reverse)])
+        var offen = (try? context.fetch(wartet)) ?? []
+        if auchFehler {
+            let fehler = FetchDescriptor<Fahrt>(predicate: #Predicate { $0.statusText == "fehler" })
+            offen += (try? context.fetch(fehler)) ?? []
+        }
         guard !offen.isEmpty else {
             meldung = "Alle Strecken sind abgeglichen"
             return
@@ -62,10 +73,18 @@ final class Abgleich: ObservableObject {
 
         let client = ValhallaClient(basis: server)
         var geschafft = 0
-        for fahrt in offen {
-            meldung = "Gleiche ab … \(geschafft + 1) von \(offen.count)"
+        var seitAnzeige = 0
+        for (nr, fahrt) in offen.enumerated() {
+            meldung = "Lege Strecken auf die Straße … \(nr + 1) von \(offen.count)"
+            let daten = fahrt.rohDaten
+            let art = fahrt.art
             do {
-                fahrt.spur = try await client.abgleichen(fahrt.punkte, art: fahrt.art)
+                // Entpacken und Abgleich laufen nicht auf dem Hauptthread
+                let spur = try await Task.detached(priority: .utility) {
+                    let punkte = (try? JSONDecoder().decode([Punkt].self, from: daten)) ?? []
+                    return try await client.abgleichen(punkte, art: art)
+                }.value
+                fahrt.spur = spur
                 fahrt.status = .fertig
                 fahrt.fehlertext = nil
                 geschafft += 1
@@ -74,6 +93,10 @@ final class Abgleich: ObservableObject {
                 fahrt.fehlertext = error.localizedDescription
             }
             try? context.save()
+            seitAnzeige += 1
+            // Karte nicht nach jeder einzelnen Strecke neu zeichnen
+            if seitAnzeige >= 25 { seitAnzeige = 0; geaendert() }
+            await Task.yield()
         }
         meldung = "\(geschafft) von \(offen.count) Strecken abgeglichen"
     }
@@ -115,6 +138,14 @@ struct ValhallaClient {
             var linie: [CLLocationCoordinate2D]
             do {
                 linie = try await teilAbgleichen(teil, art: art, duennBesetzt: duennBesetzt)
+            } catch where duennBesetzt {
+                // Lückenhafte Daten (z. B. Google): Weg zwischen den Punkten über das Straßennetz routen
+                do {
+                    linie = try await teilRouten(teil, art: art)
+                } catch {
+                    fehlgeschlagen += 1
+                    linie = teil.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+                }
             } catch {
                 // Stück ließ sich nicht zuordnen (z. B. Tiefgarage, Fähre): rohe Punkte behalten
                 fehlgeschlagen += 1
@@ -160,6 +191,45 @@ struct ValhallaClient {
             if let shape = leg["shape"] as? String {
                 linie.append(contentsOf: Polyline.dekodieren(shape, faktor: 1e6))
             }
+        }
+        return linie
+    }
+
+    /// Berechnet den Weg zwischen den Punkten mit /route (höchstens 20 Punkte pro Anfrage).
+    private func teilRouten(_ teil: [Punkt], art: FahrtArt) async throws -> [CLLocationCoordinate2D] {
+        var linie: [CLLocationCoordinate2D] = []
+        var start = 0
+        while start < teil.count - 1 {
+            let ende = min(start + 20, teil.count)
+            let stueck = Array(teil[start..<ende])
+            let anfrageDaten: [String: Any] = [
+                "locations": stueck.enumerated().map { i, p in
+                    ["lat": p.lat, "lon": p.lon, "type": (i == 0 || i == stueck.count - 1) ? "break" : "through", "radius": 50]
+                },
+                "costing": art.valhallaProfil,
+                "directions_type": "none"
+            ]
+            var anfrage = URLRequest(url: basis.appendingPathComponent("route"))
+            anfrage.httpMethod = "POST"
+            anfrage.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            anfrage.httpBody = try JSONSerialization.data(withJSONObject: anfrageDaten)
+            anfrage.timeoutInterval = 60
+            let (daten, antwort) = try await URLSession.shared.data(for: anfrage)
+            let json = try? JSONSerialization.jsonObject(with: daten) as? [String: Any]
+            guard (antwort as? HTTPURLResponse)?.statusCode == 200,
+                  let trip = json?["trip"] as? [String: Any],
+                  let legs = trip["legs"] as? [[String: Any]] else {
+                throw Fehler(text: (json?["error"] as? String) ?? "Kein Weg gefunden")
+            }
+            var teilLinie: [CLLocationCoordinate2D] = []
+            for leg in legs {
+                if let shape = leg["shape"] as? String {
+                    teilLinie.append(contentsOf: Polyline.dekodieren(shape, faktor: 1e6))
+                }
+            }
+            if !linie.isEmpty && !teilLinie.isEmpty { teilLinie.removeFirst() }
+            linie.append(contentsOf: teilLinie)
+            start = ende - 1
         }
         return linie
     }

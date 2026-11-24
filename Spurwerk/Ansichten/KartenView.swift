@@ -2,29 +2,25 @@ import SwiftUI
 import SwiftData
 import MapKit
 
-struct Linie: Identifiable {
-    let id: UUID
-    let punkte: [CLLocationCoordinate2D]
-    let abgeglichen: Bool
-    let art: FahrtArt
-}
-
 extension FahrtArt {
     /// Grundfarbe (Schein, Symbole): Auto türkis, zu Fuß lila, Fahrrad korallrot.
-    var farbe: Color {
+    var farbe: Color { Color(uiColor: uiFarbe) }
+    var hell: Color { Color(uiColor: uiHell) }
+
+    var uiFarbe: UIColor {
         switch self {
-        case .auto: Color(red: 0.11, green: 0.62, blue: 0.46)
-        case .fuss: Color(red: 0.50, green: 0.47, blue: 0.87)
-        case .rad: Color(red: 0.85, green: 0.35, blue: 0.19)
+        case .auto: UIColor(red: 0.11, green: 0.62, blue: 0.46, alpha: 1)
+        case .fuss: UIColor(red: 0.50, green: 0.47, blue: 0.87, alpha: 1)
+        case .rad: UIColor(red: 0.85, green: 0.35, blue: 0.19, alpha: 1)
         }
     }
 
     /// Hellere Farbe für den Kern der Linie – leuchtet auf der gedämpften Karte.
-    var hell: Color {
+    var uiHell: UIColor {
         switch self {
-        case .auto: Color(red: 0.36, green: 0.79, blue: 0.65)
-        case .fuss: Color(red: 0.69, green: 0.66, blue: 0.93)
-        case .rad: Color(red: 0.94, green: 0.60, blue: 0.48)
+        case .auto: UIColor(red: 0.36, green: 0.79, blue: 0.65, alpha: 1)
+        case .fuss: UIColor(red: 0.69, green: 0.66, blue: 0.93, alpha: 1)
+        case .rad: UIColor(red: 0.94, green: 0.60, blue: 0.48, alpha: 1)
         }
     }
 
@@ -38,105 +34,281 @@ extension FahrtArt {
     }
 }
 
-/// Hält die dekodierten Linien vor, damit die Karte nicht bei jedem GPS-Punkt alles neu rechnet.
+/// Alle Strecken einer Art und eines Zustands, zusammengefasst zu EINER Kartenlinie.
+/// So bleibt die Karte auch mit Tausenden importierten Strecken flüssig.
+struct SpurGruppe {
+    let art: FahrtArt
+    let abgeglichen: Bool
+    let schluessel: String          // ändert sich, sobald sich der Inhalt ändert
+    let linien: [MKPolyline]
+}
+
+/// Liest die Strecken im Hintergrund und baut daraus die Kartenlinien und die Tageswerte.
 @MainActor
 final class SpurCache: ObservableObject {
-    @Published private(set) var linien: [Linie] = []
-    private var bekannt: [UUID: (kennung: String, linie: Linie)] = [:]
+    @Published private(set) var gruppen: [SpurGruppe] = []
+    @Published private(set) var heute: [FahrtArt: Double] = [:]
 
-    func aktualisieren(_ fahrten: [Fahrt]) {
-        var neu: [Linie] = []
-        var naechste: [UUID: (kennung: String, linie: Linie)] = [:]
-        for fahrt in fahrten where fahrt.status != .aufnahme {
-            let kennung = "\(fahrt.statusText)-\(fahrt.artText)-\(fahrt.spurDaten?.count ?? 0)-\(fahrt.rohDaten.count)"
-            if let alt = bekannt[fahrt.id], alt.kennung == kennung {
-                neu.append(alt.linie)
-                naechste[fahrt.id] = alt
-                continue
-            }
-            let linie: Linie
-            if fahrt.status == .fertig, let spur = fahrt.spur {
-                linie = Linie(id: fahrt.id, punkte: spur, abgeglichen: true, art: fahrt.art)
-            } else {
-                linie = Linie(id: fahrt.id, punkte: fahrt.rohKoordinaten, abgeglichen: false, art: fahrt.art)
-            }
-            neu.append(linie)
-            naechste[fahrt.id] = (kennung, linie)
+    private struct Eintrag {
+        let kennung: String
+        let art: FahrtArt
+        let abgeglichen: Bool
+        let linie: MKPolyline
+    }
+
+    private struct Roh: @unchecked Sendable {
+        let id: UUID
+        let kennung: String
+        let art: FahrtArt
+        let abgeglichen: Bool
+        let daten: Data
+    }
+
+    private var eintraege: [UUID: Eintrag] = [:]
+    private var laeuft = false
+    private var nochmal = false
+
+    func aktualisieren(container: ModelContainer?) {
+        guard let container else { return }
+        if laeuft { nochmal = true; return }
+        laeuft = true
+
+        let context = container.mainContext
+        let alle = (try? context.fetch(FetchDescriptor<Fahrt>())) ?? []
+
+        // Tageswerte (billig, nur Zahlen)
+        let kalender = Calendar.current
+        var tag: [FahrtArt: Double] = [:]
+        var gueltig = Set<UUID>()
+        var neu: [Roh] = []
+        for f in alle where f.status != .aufnahme {
+            if kalender.isDateInToday(f.start) { tag[f.art, default: 0] += f.distanzMeter }
+            gueltig.insert(f.id)
+            let kennung = "\(f.statusText)-\(f.artText)"
+            if eintraege[f.id]?.kennung == kennung { continue }
+            // Nur geänderte Strecken werden gelesen – die Daten liegen extern und werden erst jetzt geladen
+            let abgeglichen = f.status == .fertig && f.spurDaten != nil
+            let daten = abgeglichen ? (f.spurDaten ?? Data()) : f.rohDaten
+            neu.append(Roh(id: f.id, kennung: kennung, art: f.art, abgeglichen: abgeglichen, daten: daten))
         }
-        bekannt = naechste
-        linien = neu
+        heute = tag
+        eintraege = eintraege.filter { gueltig.contains($0.key) }
+
+        Task.detached(priority: .utility) {
+            var fertig: [(UUID, Eintrag)] = []
+            for r in neu {
+                let punkte = r.abgeglichen ? Koordinaten.ausDaten(r.daten) : Self.rohPunkte(r.daten)
+                guard punkte.count > 1 else { continue }
+                let einfach = Vereinfachen.linie(punkte, toleranzMeter: 4)
+                let linie = MKPolyline(coordinates: einfach, count: einfach.count)
+                fertig.append((r.id, Eintrag(kennung: r.kennung, art: r.art, abgeglichen: r.abgeglichen, linie: linie)))
+            }
+            await MainActor.run {
+                for (id, e) in fertig { self.eintraege[id] = e }
+                self.gruppenBauen()
+                self.laeuft = false
+                if self.nochmal {
+                    self.nochmal = false
+                    self.aktualisieren(container: container)
+                }
+            }
+        }
+    }
+
+    private func gruppenBauen() {
+        var gruppen: [SpurGruppe] = []
+        for art in FahrtArt.allCases {
+            for abgeglichen in [false, true] {
+                let teil = eintraege.filter { $0.value.art == art && $0.value.abgeglichen == abgeglichen }
+                guard !teil.isEmpty else { continue }
+                // Schlüssel aus Anzahl + Inhalt, damit nur geänderte Gruppen neu gezeichnet werden
+                var hasher = Hasher()
+                for id in teil.keys.sorted(by: { $0.uuidString < $1.uuidString }) { hasher.combine(id) }
+                let schluessel = "\(art.rawValue)-\(abgeglichen)-\(teil.count)-\(hasher.finalize())"
+                gruppen.append(SpurGruppe(art: art, abgeglichen: abgeglichen, schluessel: schluessel,
+                                          linien: teil.values.map(\.linie)))
+            }
+        }
+        self.gruppen = gruppen
+    }
+
+    nonisolated private static func rohPunkte(_ daten: Data) -> [CLLocationCoordinate2D] {
+        let liste = (try? JSONDecoder().decode([Punkt].self, from: daten)) ?? []
+        return liste.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+    }
+}
+
+/// Douglas-Peucker: wirft Punkte weg, die auf der Karte keinen sichtbaren Unterschied machen.
+enum Vereinfachen {
+    static func linie(_ p: [CLLocationCoordinate2D], toleranzMeter: Double) -> [CLLocationCoordinate2D] {
+        guard p.count > 2 else { return p }
+        let kx = cos((p[0].latitude) * .pi / 180) * 111_320
+        let ky = 111_320.0
+        let tol2 = toleranzMeter * toleranzMeter
+        var behalten = [Bool](repeating: false, count: p.count)
+        behalten[0] = true
+        behalten[p.count - 1] = true
+        var stapel = [(0, p.count - 1)]
+        while let (a, b) = stapel.popLast() {
+            guard b > a + 1 else { continue }
+            let ax = p[a].longitude * kx, ay = p[a].latitude * ky
+            let bx = p[b].longitude * kx, by = p[b].latitude * ky
+            let dx = bx - ax, dy = by - ay
+            let len2 = max(dx * dx + dy * dy, 1e-9)
+            var maxD = 0.0, maxI = a
+            for i in (a + 1)..<b {
+                let px = p[i].longitude * kx, py = p[i].latitude * ky
+                let t = max(0, min(1, ((px - ax) * dx + (py - ay) * dy) / len2))
+                let qx = ax + t * dx - px, qy = ay + t * dy - py
+                let d = qx * qx + qy * qy
+                if d > maxD { maxD = d; maxI = i }
+            }
+            if maxD > tol2 {
+                behalten[maxI] = true
+                stapel.append((a, maxI))
+                stapel.append((maxI, b))
+            }
+        }
+        return p.indices.filter { behalten[$0] }.map { p[$0] }
     }
 }
 
 struct KartenView: View {
-    @Query(sort: \Fahrt.start, order: .reverse) private var fahrten: [Fahrt]
     @EnvironmentObject private var recorder: FahrtRecorder
+    @EnvironmentObject private var abgleich: Abgleich
     @StateObject private var cache = SpurCache()
-    @State private var kamera: MapCameraPosition = .userLocation(fallback: .automatic)
     @State private var filter: FahrtArt?
 
-    private var aenderungen: [String] {
-        fahrten.map { "\($0.id)-\($0.statusText)-\($0.spurDaten?.count ?? 0)" }
-    }
-
-    private var sichtbar: [Linie] {
-        cache.linien.filter { filter == nil || $0.art == filter }
-    }
-
     var body: some View {
-        Map(position: $kamera) {
-            // 1. Schein: breite, durchsichtige Linie – wo du oft lang fährst, leuchtet es kräftiger
-            ForEach(sichtbar) { linie in
-                MapPolyline(coordinates: linie.punkte)
-                    .stroke(linie.art.farbe.opacity(linie.abgeglichen ? 0.28 : 0.15),
-                            style: StrokeStyle(lineWidth: 12, lineCap: .round, lineJoin: .round))
+        SpurKarte(gruppen: cache.gruppen.filter { filter == nil || $0.art == filter },
+                  live: recorder.livePunkte,
+                  liveArt: recorder.art)
+            .ignoresSafeArea(edges: .top)
+            .safeAreaInset(edge: .top) {
+                ArtFilter(auswahl: $filter)
+                    .padding(.horizontal, 16)
             }
-            // 2. Kern: schmale, helle Linie (gestrichelt, solange noch nicht auf die Straße gelegt)
-            ForEach(sichtbar) { linie in
-                MapPolyline(coordinates: linie.punkte)
-                    .stroke(linie.art.hell,
-                            style: StrokeStyle(lineWidth: linie.abgeglichen ? 3.5 : 2.5,
-                                               lineCap: .round, lineJoin: .round,
-                                               dash: linie.abgeglichen ? [] : [5, 6]))
+            .safeAreaInset(edge: .bottom) {
+                TagesKarte(heute: cache.heute)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 6)
             }
-            if recorder.livePunkte.count > 1 {
-                MapPolyline(coordinates: recorder.livePunkte)
-                    .stroke(recorder.art.farbe.opacity(0.35), style: StrokeStyle(lineWidth: 16, lineCap: .round, lineJoin: .round))
-                MapPolyline(coordinates: recorder.livePunkte)
-                    .stroke(Color.white, style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
+            .onAppear { cache.aktualisieren(container: recorder.container) }
+            .onChange(of: abgleich.version) { _, _ in cache.aktualisieren(container: recorder.container) }
+            .onChange(of: recorder.nimmtAuf) { _, _ in cache.aktualisieren(container: recorder.container) }
+    }
+}
+
+/// Die Karte selbst – direkt mit MapKit, damit Tausende Strecken als wenige Linien gezeichnet werden.
+struct SpurKarte: UIViewRepresentable {
+    let gruppen: [SpurGruppe]
+    let live: [CLLocationCoordinate2D]
+    let liveArt: FahrtArt
+
+    func makeCoordinator() -> Koordinator { Koordinator() }
+
+    func makeUIView(context: Context) -> MKMapView {
+        let karte = MKMapView()
+        karte.delegate = context.coordinator
+        let stil = MKStandardMapConfiguration(elevationStyle: .flat, emphasisStyle: .muted)
+        stil.pointOfInterestFilter = .excludingAll
+        karte.preferredConfiguration = stil
+        karte.showsUserLocation = true
+        karte.showsCompass = true
+        karte.userTrackingMode = .follow
+        let knopf = MKUserTrackingButton(mapView: karte)
+        knopf.translatesAutoresizingMaskIntoConstraints = false
+        knopf.backgroundColor = UIColor.secondarySystemBackground.withAlphaComponent(0.85)
+        knopf.layer.cornerRadius = 10
+        karte.addSubview(knopf)
+        NSLayoutConstraint.activate([
+            knopf.trailingAnchor.constraint(equalTo: karte.safeAreaLayoutGuide.trailingAnchor, constant: -16),
+            knopf.topAnchor.constraint(equalTo: karte.safeAreaLayoutGuide.topAnchor, constant: 70),
+        ])
+        return karte
+    }
+
+    func updateUIView(_ karte: MKMapView, context: Context) {
+        context.coordinator.anwenden(karte, gruppen: gruppen, live: live, liveArt: liveArt)
+    }
+
+    final class Koordinator: NSObject, MKMapViewDelegate {
+        private struct Stil { let art: FahrtArt; let abgeglichen: Bool; let schein: Bool; let live: Bool }
+        private var aktuell: [String: [MKOverlay]] = [:]
+        private var stile: [ObjectIdentifier: Stil] = [:]
+        private var liveOverlays: [MKOverlay] = []
+        private var liveAnzahl = 0
+
+        func anwenden(_ karte: MKMapView, gruppen: [SpurGruppe], live: [CLLocationCoordinate2D], liveArt: FahrtArt) {
+            let gewuenscht = Set(gruppen.map(\.schluessel))
+            for (schluessel, overlays) in aktuell where !gewuenscht.contains(schluessel) {
+                karte.removeOverlays(overlays)
+                overlays.forEach { stile[ObjectIdentifier($0)] = nil }
+                aktuell[schluessel] = nil
             }
-            UserAnnotation()
+            for g in gruppen where aktuell[g.schluessel] == nil {
+                let schein = MKMultiPolyline(g.linien)
+                let kern = MKMultiPolyline(g.linien)
+                stile[ObjectIdentifier(schein)] = Stil(art: g.art, abgeglichen: g.abgeglichen, schein: true, live: false)
+                stile[ObjectIdentifier(kern)] = Stil(art: g.art, abgeglichen: g.abgeglichen, schein: false, live: false)
+                // Erst alle Scheine, dann die Kerne darüber
+                karte.insertOverlay(schein, at: 0, level: .aboveRoads)
+                karte.addOverlay(kern, level: .aboveRoads)
+                aktuell[g.schluessel] = [schein, kern]
+            }
+
+            if live.count != liveAnzahl {
+                karte.removeOverlays(liveOverlays)
+                liveOverlays.forEach { stiles in stile[ObjectIdentifier(stiles)] = nil }
+                liveOverlays = []
+                liveAnzahl = live.count
+                if live.count > 1 {
+                    let schein = MKPolyline(coordinates: live, count: live.count)
+                    let kern = MKPolyline(coordinates: live, count: live.count)
+                    stile[ObjectIdentifier(schein)] = Stil(art: liveArt, abgeglichen: true, schein: true, live: true)
+                    stile[ObjectIdentifier(kern)] = Stil(art: liveArt, abgeglichen: true, schein: false, live: true)
+                    karte.addOverlays([schein, kern], level: .aboveLabels)
+                    liveOverlays = [schein, kern]
+                }
+            }
         }
-        .mapStyle(.standard(elevation: .flat, emphasis: .muted, pointsOfInterest: .excludingAll))
-        .mapControls {
-            MapUserLocationButton()
-            MapCompass()
+
+        func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+            guard let stil = stile[ObjectIdentifier(overlay)] else { return MKOverlayRenderer(overlay: overlay) }
+            let r: MKOverlayPathRenderer
+            if let multi = overlay as? MKMultiPolyline {
+                r = MKMultiPolylineRenderer(multiPolyline: multi)
+            } else if let einzel = overlay as? MKPolyline {
+                r = MKPolylineRenderer(polyline: einzel)
+            } else {
+                return MKOverlayRenderer(overlay: overlay)
+            }
+            r.lineCap = .round
+            r.lineJoin = .round
+            if stil.live {
+                r.strokeColor = stil.schein ? stil.art.uiFarbe.withAlphaComponent(0.35) : .white
+                r.lineWidth = stil.schein ? 16 : 4
+            } else if stil.schein {
+                r.strokeColor = stil.art.uiFarbe.withAlphaComponent(stil.abgeglichen ? 0.28 : 0.15)
+                r.lineWidth = 12
+            } else {
+                r.strokeColor = stil.art.uiHell
+                r.lineWidth = stil.abgeglichen ? 3.5 : 2.5
+                if !stil.abgeglichen { r.lineDashPattern = [5, 6] }
+            }
+            return r
         }
-        .safeAreaInset(edge: .top) {
-            ArtFilter(auswahl: $filter)
-                .padding(.horizontal, 16)
-        }
-        .safeAreaInset(edge: .bottom) {
-            TagesKarte(fahrten: fahrten)
-                .padding(.horizontal, 10)
-                .padding(.bottom, 6)
-        }
-        .onAppear { cache.aktualisieren(fahrten) }
-        .onChange(of: aenderungen) { _, _ in cache.aktualisieren(fahrten) }
     }
 }
 
 /// Untere Karte: heutige Kilometer und der runde Aufnahmeknopf.
 struct TagesKarte: View {
-    let fahrten: [Fahrt]
+    let heute: [FahrtArt: Double]
     @EnvironmentObject private var recorder: FahrtRecorder
     @EnvironmentObject private var abgleich: Abgleich
 
-    private func heute(_ art: FahrtArt) -> Double {
-        let kalender = Calendar.current
-        var summe = fahrten
-            .filter { $0.art == art && kalender.isDateInToday($0.start) && $0.status != .aufnahme }
-            .reduce(0) { $0 + $1.distanzMeter }
+    private func wert(_ art: FahrtArt) -> Double {
+        var summe = heute[art] ?? 0
         if recorder.nimmtAuf && recorder.art == art { summe += recorder.liveDistanz }
         return summe
     }
@@ -151,21 +323,20 @@ struct TagesKarte: View {
             HStack(alignment: .firstTextBaseline) {
                 Text("Heute").font(.headline)
                 Spacer()
-                Text(Date.now.formatted(.dateTime.weekday(.wide).day().month(.abbreviated)))
+                Text(Date.now.formatted(.dateTime.weekday(.wide).day().month(.abbreviated).locale(Locale(identifier: "de_DE"))))
                     .font(.caption).foregroundStyle(.secondary)
             }
 
-            let arten = FahrtArt.allCases.filter { $0 != .rad || heute(.rad) > 0 }
+            let arten = FahrtArt.allCases.filter { $0 != .rad || wert(.rad) > 0 }
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
                 ForEach(arten) { art in
                     VStack(alignment: .leading, spacing: 2) {
                         Label(art.name, systemImage: art.symbol)
                             .font(.caption)
                             .foregroundStyle(art.hell)
-                        Text(Format.km(heute(art)))
+                        Text(Format.km(wert(art)))
                             .font(.title3.weight(.semibold))
                             .monospacedDigit()
-                            .contentTransition(.numericText())
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(10)
@@ -187,9 +358,10 @@ struct TagesKarte: View {
                     } else {
                         Text("Aufnahme starten").font(.subheadline.weight(.semibold))
                         Text(abgleich.laeuft
-                             ? "Lege Strecken auf die Straße …"
+                             ? (abgleich.meldung ?? "Lege Strecken auf die Straße …")
                              : (recorder.automatik ? "Automatik an · lange drücken für Fuß/Rad" : "Lange drücken für Fuß/Rad"))
                             .font(.caption).foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
                 }
                 Spacer(minLength: 0)
@@ -199,7 +371,6 @@ struct TagesKarte: View {
         .padding(.top, 10)
         .padding(.bottom, 16)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
-        .animation(.snappy, value: recorder.liveDistanz)
     }
 }
 

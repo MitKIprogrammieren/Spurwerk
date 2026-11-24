@@ -125,6 +125,7 @@ struct EinstellungenView: View {
                     try GoogleImport.lesen(daten)
                 }.value
                 let ergebnis = GoogleImport.speichern(strecken, in: context)
+                abgleich.geaendert()
                 importMeldung = strecken.isEmpty
                     ? "Keine Auto-, Fuß- oder Radstrecken in der Datei gefunden."
                     : "\(ergebnis.neu) Strecken übernommen, \(ergebnis.doppelt) waren schon da. Sie werden jetzt nach und nach auf die Straßen gelegt."

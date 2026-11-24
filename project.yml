@@ -1,6 +1,7 @@
 name: Spurwerk
 options:
   bundleIdPrefix: de.mitkiprogrammieren
+  developmentLanguage: de
   deploymentTarget:
     iOS: "17.0"
 settings:
@@ -23,6 +24,8 @@ targets:
       path: Spurwerk/Info.plist
       properties:
         CFBundleDisplayName: Spurwerk
+        CFBundleDevelopmentRegion: de
+        CFBundleLocalizations: [de]
         UILaunchScreen: {}
         UIBackgroundModes: [location]
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]

@@ -41,6 +41,7 @@ struct FahrtenListe: View {
                             context.delete(fahrten[i])
                         }
                         try? context.save()
+                        Abgleich.shared.geaendert()
                     }
                 }
             }
