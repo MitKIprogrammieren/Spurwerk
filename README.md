@@ -24,3 +24,11 @@ Sobald das Projekt auf GitHub liegt, baut GitHub Actions die IPA bei jedem Push 
 
 `valhalla/compose.yaml` läuft auf dem NUC als Stack `spurwerk-valhalla`.
 Test: `http://192.168.1.30:8002/status`
+
+## Spurwerk-Server (NUC)
+
+`server/` – Stack `spurwerk` auf dem NUC, Port **8084** (Browser: http://192.168.1.30:8084).
+Speichert alle Strecken (SQLite unter /opt/stacks/spurwerk/daten), legt wartende Strecken selbst mit Valhalla
+auf die Straße und zeigt Karte + Streckenliste im Browser (Tag/Woche/Monat/Jahr/Alles).
+Die App lädt neue/geänderte Strecken hoch (`/api/hochladen`) und holt fertige Linien ab (`/api/abholen`).
+Ist der Server nicht erreichbar, gleicht die App wie früher selbst über Valhalla ab.

@@ -72,6 +72,10 @@ final class Fahrt {
     var artText: String = "auto"
     /// „app“ = selbst aufgezeichnet, „google“ = aus der Google-Zeitachse importiert
     var quelle: String = "app"
+    /// Mittlerer Abstand der GPS-Punkte in Metern (0 = noch nicht berechnet). Groß = lückenhaft = geschätzt.
+    var dichte: Double = 0
+    /// Muss (noch einmal) an den Spurwerk-Server geschickt werden.
+    var mussHoch: Bool = true
 
     init(start: Date, art: FahrtArt = .auto) {
         self.start = start
@@ -106,6 +110,41 @@ final class Fahrt {
     var dauer: TimeInterval {
         (ende ?? Date()).timeIntervalSince(start)
     }
+
+    /// Lückenhafte Google-Strecke: der Weg zwischen den Punkten ist geschätzt.
+    var geschaetzt: Bool { dichte > 150 }
+
+    /// Art ändern: wird danach mit dem passenden Profil neu auf die Straße gelegt.
+    func artAendern(_ neu: FahrtArt) {
+        guard neu != art else { return }
+        art = neu
+        if status == .fertig || status == .fehler { status = .wartet }
+        mussHoch = true
+    }
+}
+
+extension FahrtArt {
+    /// Google rät die Verkehrsmittel oft falsch (Stau oder Bus als „Fahrrad“).
+    /// Fahrrad gilt nur bei 8–25 km/h – schneller ist Auto, langsamer zu Fuß.
+    static func plausibel(_ art: FahrtArt, meter: Double, sekunden: Double) -> FahrtArt {
+        guard art == .rad, sekunden > 0, meter > 0 else { return art }
+        let kmh = meter / sekunden * 3.6
+        if kmh > 25 { return .auto }
+        if kmh < 8 { return .fuss }
+        return .rad
+    }
+}
+
+func mittlererAbstand(_ punkte: [Punkt]) -> Double {
+    guard punkte.count > 1 else { return 0 }
+    var summe = 0.0
+    for i in 1..<punkte.count {
+        let a = punkte[i - 1], b = punkte[i]
+        let dLat = (b.lat - a.lat) * 111_320
+        let dLon = (b.lon - a.lon) * 111_320 * cos(a.lat * .pi / 180)
+        summe += (dLat * dLat + dLon * dLon).squareRoot()
+    }
+    return summe / Double(punkte.count - 1)
 }
 
 /// Speichert Koordinaten kompakt als Binärdaten (schneller als JSON).
@@ -135,9 +174,26 @@ enum Koordinaten {
 }
 
 enum Format {
+    private static let zahl: NumberFormatter = {
+        let f = NumberFormatter()
+        f.locale = Locale(identifier: "de_DE")
+        f.numberStyle = .decimal
+        f.usesGroupingSeparator = true
+        return f
+    }()
+
     static func km(_ meter: Double) -> String {
         if meter < 1000 { return "\(Int(meter)) m" }
-        return String(format: "%.1f km", meter / 1000).replacingOccurrences(of: ".", with: ",")
+        let km = meter / 1000
+        zahl.minimumFractionDigits = km < 1000 ? 1 : 0
+        zahl.maximumFractionDigits = km < 1000 ? 1 : 0
+        return (zahl.string(from: NSNumber(value: km)) ?? "\(Int(km))") + " km"
+    }
+
+    static func anzahl(_ n: Int) -> String {
+        zahl.minimumFractionDigits = 0
+        zahl.maximumFractionDigits = 0
+        return zahl.string(from: NSNumber(value: n)) ?? "\(n)"
     }
 
     static func dauer(_ sekunden: TimeInterval) -> String {

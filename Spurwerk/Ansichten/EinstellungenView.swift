@@ -8,6 +8,8 @@ struct EinstellungenView: View {
     @AppStorage("serverHeim") private var serverHeim = Abgleich.standardHeim
     @AppStorage("serverUnterwegs") private var serverUnterwegs = Abgleich.standardUnterwegs
     @AppStorage("erscheinung") private var erscheinung = "dunkel"
+    @AppStorage("spurHeim") private var spurHeim = Abgleich.standardSpurHeim
+    @AppStorage("spurUnterwegs") private var spurUnterwegs = Abgleich.standardSpurUnterwegs
     @Environment(\.modelContext) private var context
     @State private var importZeigen = false
     @State private var importLaeuft = false
@@ -83,6 +85,22 @@ struct EinstellungenView: View {
                 }
 
                 Section {
+                    TextField("Heimnetz", text: $spurHeim)
+                        .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    TextField("Unterwegs (Tailscale)", text: $spurUnterwegs)
+                        .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    if let url = URL(string: spurHeim) {
+                        Link(destination: url) {
+                            Label("Im Browser öffnen", systemImage: "safari")
+                        }
+                    }
+                } header: {
+                    Text("Spurwerk auf dem NUC")
+                } footer: {
+                    Text("Die App lädt alle Strecken auf den NUC. Dort werden sie auf die Straße gelegt und gesichert – das iPhone muss dafür nicht offen bleiben. Im Browser siehst du alles unter derselben Adresse.")
+                }
+
+                Section {
                     TextField("Heimnetz", text: $serverHeim)
                         .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
                     TextField("Unterwegs (Tailscale)", text: $serverUnterwegs)
@@ -99,7 +117,7 @@ struct EinstellungenView: View {
                         Text(meldung).font(.footnote).foregroundStyle(.secondary)
                     }
                 } header: {
-                    Text("Kartendienst auf dem NUC")
+                    Text("Kartendienst (Valhalla) – Ersatz, wenn Spurwerk-NUC fehlt")
                 } footer: {
                     Text("Die App probiert erst das Heimnetz, dann Tailscale. Ist keiner erreichbar, wartet die Strecke und wird später abgeglichen. Fußwege werden auf Geh- und Feldwege gelegt, Autofahrten nur auf Straßen.")
                 }

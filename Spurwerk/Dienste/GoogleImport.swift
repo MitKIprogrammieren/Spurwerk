@@ -70,8 +70,9 @@ enum GoogleImport {
                 Punkt(lat: $0.lat, lon: $0.lon, zeit: $0.zeit.timeIntervalSince1970, genauigkeit: 50, tempo: -1)
             }
             let distanz = a.distanz > 0 ? a.distanz : luftlinie(punkte)
-            guard distanz >= a.art.mindestStrecke else { continue }
-            strecken.append(Strecke(art: a.art, start: a.start, ende: a.ende, distanz: distanz, punkte: punkte))
+            let art = FahrtArt.plausibel(a.art, meter: distanz, sekunden: a.ende.timeIntervalSince(a.start))
+            guard distanz >= art.mindestStrecke else { continue }
+            strecken.append(Strecke(art: art, start: a.start, ende: a.ende, distanz: distanz, punkte: punkte))
         }
         return strecken.sorted { $0.start < $1.start }
     }
@@ -152,6 +153,7 @@ enum GoogleImport {
             fahrt.punkte = s.punkte
             fahrt.distanzMeter = s.distanz
             fahrt.quelle = "google"
+            fahrt.dichte = mittlererAbstand(s.punkte)
             fahrt.status = .wartet
             context.insert(fahrt)
             ergebnis.neu += 1

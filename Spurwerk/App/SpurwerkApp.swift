@@ -14,6 +14,16 @@ struct SpurwerkApp: App {
             fatalError("Datenbank konnte nicht geöffnet werden: \(error)")
         }
         FahrtRecorder.shared.vorbereiten(container: container)
+        // Einmalig nach dem Update: Genauigkeit berechnen, falsche Google-Fahrräder korrigieren
+        if !UserDefaults.standard.bool(forKey: "wartung1") {
+            let c = container
+            Task.detached(priority: .utility) {
+                let korrigiert = await Wartung(modelContainer: c).einmalig()
+                UserDefaults.standard.set(true, forKey: "wartung1")
+                UserDefaults.standard.set(korrigiert, forKey: "wartung1Korrigiert")
+                await MainActor.run { Abgleich.shared.geaendert() }
+            }
+        }
     }
 
     var body: some Scene {
@@ -53,6 +63,15 @@ struct HauptView: View {
         .onChange(of: phase) { _, neu in
             guard neu == .active, let container = recorder.container else { return }
             Task { await Abgleich.shared.ausstehendeAbgleichen(container: container) }
+        }
+        .task {
+            // Solange die App offen ist: jede Minute fertige Linien vom NUC abholen
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+                if phase == .active, let container = recorder.container {
+                    await Abgleich.shared.ausstehendeAbgleichen(container: container)
+                }
+            }
         }
     }
 }

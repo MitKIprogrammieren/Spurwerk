@@ -9,6 +9,8 @@ final class Abgleich: ObservableObject {
 
     static let standardHeim = "http://192.168.1.30:8002"
     static let standardUnterwegs = "http://nuc-schichtlohn.tail293912.ts.net:8002"
+    static let standardSpurHeim = "http://192.168.1.30:8084"
+    static let standardSpurUnterwegs = "http://nuc-schichtlohn.tail293912.ts.net:8084"
 
     @Published private(set) var laeuft = false
     @Published private(set) var meldung: String?
@@ -18,6 +20,55 @@ final class Abgleich: ObservableObject {
         let heim = d.string(forKey: "serverHeim") ?? Self.standardHeim
         let unterwegs = d.string(forKey: "serverUnterwegs") ?? Self.standardUnterwegs
         return [heim, unterwegs].map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+
+    /// Spurwerk-Server auf dem NUC (speichert alles und gleicht selbst ab).
+    func erreichbarerSpurServer() async -> URL? {
+        let d = UserDefaults.standard
+        let liste = [d.string(forKey: "spurHeim") ?? Self.standardSpurHeim,
+                     d.string(forKey: "spurUnterwegs") ?? Self.standardSpurUnterwegs]
+        for text in liste.map({ $0.trimmingCharacters(in: .whitespaces) }) where !text.isEmpty {
+            guard let url = URL(string: text) else { continue }
+            var anfrage = URLRequest(url: url.appendingPathComponent("api/status"))
+            anfrage.timeoutInterval = 4
+            if let (_, antwort) = try? await URLSession.shared.data(for: anfrage),
+               (antwort as? HTTPURLResponse)?.statusCode == 200 {
+                return url
+            }
+        }
+        return nil
+    }
+
+    /// Mit dem NUC abgleichen: hochladen, fertige Linien abholen, Stand anzeigen.
+    private func mitServer(_ server: URL, container: ModelContainer) async {
+        let sync = SyncArbeiter(modelContainer: container)
+        do {
+            let hoch = try await sync.hochladen(server: server) { n, gesamt in
+                await MainActor.run { Abgleich.shared.meldung = "Lade Strecken auf den NUC … \(Format.anzahl(n)) von \(Format.anzahl(gesamt))" }
+            }
+            let seit = UserDefaults.standard.double(forKey: "abgeholtBis")
+            let (geholt, stand) = try await sync.abholen(server: server, seit: seit)
+            UserDefaults.standard.set(stand, forKey: "abgeholtBis")
+            if hoch > 0 || geholt > 0 { geaendert() }
+            if let s = try? await SyncArbeiter.holen(server.appendingPathComponent("api/status")),
+               let z = s["zahlen"] as? [String: Int] {
+                let gesamt = z.values.reduce(0, +), fertig = z["fertig"] ?? 0
+                let offen = (z["wartet"] ?? 0) + (z["laeuft"] ?? 0)
+                meldung = offen > 0
+                    ? "NUC legt Strecken auf die Straße: \(Format.anzahl(fertig)) von \(Format.anzahl(gesamt))"
+                    : "Alle \(Format.anzahl(gesamt)) Strecken auf dem NUC abgeglichen"
+            }
+        } catch {
+            meldung = "NUC: \(error.localizedDescription)"
+        }
+    }
+
+    /// Strecke auch auf dem NUC löschen (wenn erreichbar).
+    func loeschen(_ ids: [UUID]) {
+        Task {
+            guard let server = await erreichbarerSpurServer() else { return }
+            _ = try? await SyncArbeiter.senden(["ids": ids.map(\.uuidString)], an: server.appendingPathComponent("api/loeschen"))
+        }
     }
 
     /// Erster Server, der antwortet – erst Heimnetz, dann Tailscale.
@@ -53,6 +104,19 @@ final class Abgleich: ObservableObject {
         laeuft = true
         defer { laeuft = false; geaendert() }
 
+        // Ist der Spurwerk-Server da, rechnet der NUC – das iPhone lädt nur hoch und holt ab.
+        if let spur = await erreichbarerSpurServer() {
+            if auchFehler {
+                // Strecken ohne Straße noch einmal an den NUC geben
+                let d = FetchDescriptor<Fahrt>(predicate: #Predicate { $0.statusText == "fehler" })
+                for f in (try? container.mainContext.fetch(d)) ?? [] { f.status = .wartet; f.mussHoch = true }
+                try? container.mainContext.save()
+            }
+            await mitServer(spur, container: container)
+            return
+        }
+
+        // Sonst wie bisher selbst über Valhalla abgleichen.
         // Lesen und Speichern passiert in einem eigenen Hintergrund-Kontext – die Oberfläche bleibt frei
         let arbeiter = AbgleichArbeiter(modelContainer: container)
         let offen = await arbeiter.offeneIDs(auchFehler: auchFehler)
@@ -91,6 +155,7 @@ final class Abgleich: ObservableObject {
 
     func eineAbgleichen(_ fahrt: Fahrt, container: ModelContainer) async {
         fahrt.status = .wartet
+        fahrt.mussHoch = true
         try? container.mainContext.save()
         await ausstehendeAbgleichen(container: container)
     }

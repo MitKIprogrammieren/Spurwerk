@@ -3,29 +3,73 @@ import SwiftData
 import MapKit
 
 struct FahrtenListe: View {
-    @Query(sort: \Fahrt.start, order: .reverse) private var fahrten: [Fahrt]
     @Environment(\.modelContext) private var context
+    @EnvironmentObject private var recorder: FahrtRecorder
+    @EnvironmentObject private var abgleich: Abgleich
+    @ObservedObject private var zeit = ZeitFilter.shared
+    @ObservedObject private var cache = SpurCache.shared
 
-    private func gesamt(_ art: FahrtArt) -> Double {
-        fahrten.filter { $0.art == art }.reduce(0) { $0 + $1.distanzMeter }
+    @State private var fahrten: [Fahrt] = []
+    @State private var grenze = 150
+    @State private var artFilter: FahrtArt?
+    @State private var aendernFrage: FahrtArt?
+
+    /// Lädt nur die sichtbare Seite – nie alle Strecken auf einmal.
+    private func laden() {
+        let (von, bis) = zeit.bereich
+        var d: FetchDescriptor<Fahrt>
+        if let a = artFilter?.rawValue {
+            d = FetchDescriptor(predicate: #Predicate { $0.start >= von && $0.start < bis && $0.artText == a },
+                                sortBy: [SortDescriptor(\.start, order: .reverse)])
+        } else {
+            d = FetchDescriptor(predicate: #Predicate { $0.start >= von && $0.start < bis },
+                                sortBy: [SortDescriptor(\.start, order: .reverse)])
+        }
+        d.fetchLimit = grenze
+        fahrten = (try? context.fetch(d)) ?? []
+    }
+
+    /// Alle Strecken im aktuellen Zeitraum/Filter auf eine andere Art umstellen.
+    private func alleAendern(zu neu: FahrtArt) {
+        let (von, bis) = zeit.bereich
+        let a = artFilter?.rawValue ?? ""
+        let d = FetchDescriptor<Fahrt>(predicate: #Predicate { $0.start >= von && $0.start < bis && $0.artText == a })
+        let alle = (try? context.fetch(d)) ?? []
+        for f in alle { f.artAendern(neu) }
+        try? context.save()
+        abgleich.geaendert()
+        artFilter = neu
+        laden()
+        if let c = recorder.container { Task { await abgleich.ausstehendeAbgleichen(container: c) } }
     }
 
     var body: some View {
         NavigationStack {
             List {
-                if !fahrten.isEmpty {
-                    Section {
-                        ForEach(FahrtArt.allCases) { art in
-                            let strecke = gesamt(art)
-                            if strecke > 0 {
+                Section {
+                    ZeitLeiste()
+                        .listRowBackground(Color.clear)
+                        .listRowInsets(EdgeInsets())
+                }
+                Section {
+                    ForEach(FahrtArt.allCases) { art in
+                        let km = cache.summen[art] ?? 0
+                        if km > 0 {
+                            Button {
+                                artFilter = artFilter == art ? nil : art
+                            } label: {
                                 LabeledContent {
-                                    Text(Format.km(strecke))
+                                    Text("\(Format.km(km)) · \(Format.anzahl(cache.anzahl[art] ?? 0))")
                                 } label: {
-                                    Label(art.name, systemImage: art.symbol).foregroundStyle(art.farbe)
+                                    Label(art.name, systemImage: artFilter == art ? "checkmark.circle.fill" : art.symbol)
+                                        .foregroundStyle(art.farbe)
                                 }
                             }
+                            .buttonStyle(.plain)
                         }
                     }
+                } footer: {
+                    Text(artFilter == nil ? "Art antippen, um nur diese Strecken zu zeigen." : "Nur \(artFilter!.name) – zum Aufheben noch einmal antippen.")
                 }
                 Section {
                     ForEach(fahrten) { fahrt in
@@ -37,22 +81,63 @@ struct FahrtenListe: View {
                         .disabled(fahrt.status == .aufnahme)
                     }
                     .onDelete { stellen in
+                        var weg: [UUID] = []
                         for i in stellen where fahrten[i].status != .aufnahme {
+                            weg.append(fahrten[i].id)
                             context.delete(fahrten[i])
                         }
                         try? context.save()
-                        Abgleich.shared.geaendert()
+                        abgleich.loeschen(weg)
+                        abgleich.geaendert()
+                        laden()
+                    }
+                    if fahrten.count == grenze {
+                        Button("Mehr laden") {
+                            grenze += 150
+                            laden()
+                        }
+                        .frame(maxWidth: .infinity)
                     }
                 }
             }
             .navigationTitle("Strecken")
-            .overlay {
-                if fahrten.isEmpty {
-                    ContentUnavailableView("Noch keine Strecken",
-                                           systemImage: "car",
-                                           description: Text("Tippe auf der Karte auf „Start“ oder lass die Automatik laufen."))
+            .toolbar {
+                if let artFilter {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Menu {
+                            ForEach(FahrtArt.allCases.filter { $0 != artFilter }) { ziel in
+                                Button {
+                                    aendernFrage = ziel
+                                } label: {
+                                    Label("Alle zu \(ziel.name)", systemImage: ziel.symbol)
+                                }
+                            }
+                        } label: {
+                            Label("Alle ändern", systemImage: "arrow.triangle.swap")
+                        }
+                    }
                 }
             }
+            .confirmationDialog("Alle Strecken umstellen?",
+                                isPresented: Binding(get: { aendernFrage != nil }, set: { if !$0 { aendernFrage = nil } }),
+                                titleVisibility: .visible) {
+                if let ziel = aendernFrage, let quelle = artFilter {
+                    Button("\(Format.anzahl(cache.anzahl[quelle] ?? 0)) Strecken zu \(ziel.name)") { alleAendern(zu: ziel) }
+                }
+            } message: {
+                Text("Gilt für alle \(artFilter?.name ?? "")-Strecken in „\(zeit.text)“. Sie werden danach neu auf die Straße gelegt.")
+            }
+            .overlay {
+                if fahrten.isEmpty {
+                    ContentUnavailableView("Keine Strecken",
+                                           systemImage: "car",
+                                           description: Text("In diesem Zeitraum gibt es keine Strecken."))
+                }
+            }
+            .onAppear { laden() }
+            .onChange(of: zeit.schluessel) { _, _ in grenze = 150; laden() }
+            .onChange(of: artFilter) { _, _ in grenze = 150; laden() }
+            .onChange(of: abgleich.version) { _, _ in laden() }
         }
     }
 }
@@ -66,9 +151,9 @@ struct FahrtZeile: View {
                 .foregroundStyle(fahrt.art.farbe)
                 .frame(width: 26)
             VStack(alignment: .leading, spacing: 3) {
-                Text(fahrt.start.formatted(.dateTime.weekday(.abbreviated).day().month(.abbreviated).hour().minute()))
+                Text(fahrt.start.formatted(.dateTime.weekday(.abbreviated).day().month(.abbreviated).year().hour().minute().locale(Locale(identifier: "de_DE"))))
                     .font(.headline)
-                Text("\(Format.km(fahrt.distanzMeter)) · \(Format.dauer(fahrt.dauer))")
+                Text("\(Format.km(fahrt.distanzMeter)) · \(Format.dauer(fahrt.dauer))\(fahrt.geschaetzt ? " · geschätzt" : "")")
                     .font(.subheadline).foregroundStyle(.secondary)
             }
             Spacer()
@@ -100,6 +185,7 @@ struct StatusMarke: View {
 
 struct FahrtDetail: View {
     let fahrt: Fahrt
+    @Environment(\.modelContext) private var context
     @EnvironmentObject private var recorder: FahrtRecorder
     @EnvironmentObject private var abgleich: Abgleich
     @State private var rohZeigen = false
@@ -128,7 +214,17 @@ struct FahrtDetail: View {
             .mapStyle(.standard(pointsOfInterest: .excludingAll))
 
             List {
-                LabeledContent("Art") { Label(fahrt.art.name, systemImage: fahrt.art.symbol) }
+                Picker("Art", selection: Binding(get: { fahrt.art }, set: { neu in
+                    fahrt.artAendern(neu)
+                    try? context.save()
+                    abgleich.geaendert()
+                    if let c = recorder.container { Task { await abgleich.ausstehendeAbgleichen(container: c) } }
+                })) {
+                    ForEach(FahrtArt.allCases) { Label($0.name, systemImage: $0.symbol).tag($0) }
+                }
+                if fahrt.geschaetzt {
+                    LabeledContent("Genauigkeit", value: "geschätzt (Punkte alle \(Int(fahrt.dichte)) m)")
+                }
                 LabeledContent("Strecke", value: Format.km(fahrt.distanzMeter))
                 if fahrt.quelle == "google" {
                     LabeledContent("Quelle", value: "Google-Zeitachse")

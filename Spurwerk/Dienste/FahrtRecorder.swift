@@ -149,6 +149,8 @@ final class FahrtRecorder: NSObject, ObservableObject {
             fahrt.distanzMeter = liveDistanz
             fahrt.ende = Date()
             fahrt.status = .wartet
+            fahrt.dichte = mittlererAbstand(punkte)
+            fahrt.mussHoch = true
         }
         try? context.save()
         livePunkte = []
