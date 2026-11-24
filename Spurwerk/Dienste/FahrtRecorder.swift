@@ -3,12 +3,14 @@ import CoreLocation
 import CoreMotion
 import SwiftData
 
-/// Zeichnet Fahrten per GPS auf – von Hand oder automatisch, sobald das iPhone eine Autofahrt erkennt.
+/// Zeichnet Strecken per GPS auf – Auto, zu Fuß oder Fahrrad.
+/// Von Hand oder automatisch, sobald das iPhone erkennt, dass du fährst bzw. läufst.
 @MainActor
 final class FahrtRecorder: NSObject, ObservableObject {
     static let shared = FahrtRecorder()
 
     @Published private(set) var nimmtAuf = false
+    @Published private(set) var art: FahrtArt = .auto
     @Published private(set) var livePunkte: [CLLocationCoordinate2D] = []
     @Published private(set) var liveDistanz: Double = 0
     @Published private(set) var startZeit: Date?
@@ -28,28 +30,37 @@ final class FahrtRecorder: NSObject, ObservableObject {
     private var pruefTimer: Timer?
     private var hintergrundSitzung: CLBackgroundActivitySession?
     private var bewegungLaeuft = false
+    /// Nach einem verworfenen Mini-Fußweg eine Weile keine neue Fußaufnahme starten.
+    private var fussPauseBis = Date.distantPast
 
-    /// Mindeststrecke, damit eine Fahrt behalten wird.
-    private let mindestStrecke: Double = 300
+    // MARK: - Einstellungen
 
-    var automatik: Bool {
+    /// Autofahrten automatisch aufzeichnen (Schlüssel „automatik“ aus der ersten Version).
+    var automatikAuto: Bool {
         get { UserDefaults.standard.object(forKey: "automatik") as? Bool ?? true }
-        set {
-            objectWillChange.send()
-            UserDefaults.standard.set(newValue, forKey: "automatik")
-            if newValue && manager.authorizationStatus == .authorizedWhenInUse {
-                manager.requestAlwaysAuthorization()
-            }
-            automatikAnwenden()
+        set { einstellen("automatik", newValue) }
+    }
+
+    /// Fußwege automatisch aufzeichnen.
+    var automatikFuss: Bool {
+        get { UserDefaults.standard.object(forKey: "automatikFuss") as? Bool ?? false }
+        set { einstellen("automatikFuss", newValue) }
+    }
+
+    var automatik: Bool { automatikAuto || automatikFuss }
+
+    private func einstellen(_ schluessel: String, _ wert: Bool) {
+        objectWillChange.send()
+        UserDefaults.standard.set(wert, forKey: schluessel)
+        if wert && manager.authorizationStatus == .authorizedWhenInUse {
+            manager.requestAlwaysAuthorization()
         }
+        automatikAnwenden()
     }
 
     override init() {
         super.init()
         manager.delegate = self
-        manager.activityType = .automotiveNavigation
-        manager.desiredAccuracy = kCLLocationAccuracyBestForNavigation
-        manager.distanceFilter = 5
         manager.pausesLocationUpdatesAutomatically = false
         berechtigung = manager.authorizationStatus
     }
@@ -70,15 +81,16 @@ final class FahrtRecorder: NSObject, ObservableObject {
 
     // MARK: - Aufnahme
 
-    func starten(automatisch: Bool = false) {
+    func starten(_ art: FahrtArt, automatisch: Bool = false) {
         guard !nimmtAuf, let container else { return }
         if manager.authorizationStatus == .notDetermined {
             manager.requestWhenInUseAuthorization()
         }
-        let fahrt = Fahrt(start: Date())
+        let fahrt = Fahrt(start: Date(), art: art)
         container.mainContext.insert(fahrt)
         try? container.mainContext.save()
 
+        self.art = art
         aktuelleFahrt = fahrt
         punkte = []
         livePunkte = []
@@ -90,6 +102,20 @@ final class FahrtRecorder: NSObject, ObservableObject {
         automatischGestartet = automatisch
         nimmtAuf = true
 
+        switch art {
+        case .auto:
+            manager.activityType = .automotiveNavigation
+            manager.desiredAccuracy = kCLLocationAccuracyBestForNavigation
+            manager.distanceFilter = 5
+        case .fuss:
+            manager.activityType = .fitness
+            manager.desiredAccuracy = kCLLocationAccuracyBest
+            manager.distanceFilter = 3
+        case .rad:
+            manager.activityType = .fitness
+            manager.desiredAccuracy = kCLLocationAccuracyBest
+            manager.distanceFilter = 4
+        }
         manager.allowsBackgroundLocationUpdates = true
         manager.showsBackgroundLocationIndicator = true
         hintergrundSitzung = CLBackgroundActivitySession()
@@ -116,7 +142,7 @@ final class FahrtRecorder: NSObject, ObservableObject {
         aktuelleFahrt = nil
         let context = container.mainContext
 
-        if liveDistanz < mindestStrecke {
+        if liveDistanz < fahrt.art.mindestStrecke {
             context.delete(fahrt)
         } else {
             fahrt.punkte = punkte
@@ -142,22 +168,37 @@ final class FahrtRecorder: NSObject, ObservableObject {
     private func stillstandPruefen() {
         guard nimmtAuf else { return }
         if Date().timeIntervalSince(letztesSpeichern) > 30 { zwischenspeichern() }
-        guard automatischGestartet else { return }
-        // 5 Minuten kein Fahren oder 90 Sekunden zu Fuß → Fahrt ist vorbei
-        if Date().timeIntervalSince(letzteBewegung) > 300 {
-            beenden()
-        } else if let g = gehenSeit, Date().timeIntervalSince(g) > 90 {
-            beenden()
+        guard automatischGestartet, let start = startZeit else { return }
+        let jetzt = Date()
+
+        switch art {
+        case .auto:
+            // 5 Minuten kein Fahren → geparkt
+            if jetzt.timeIntervalSince(letzteBewegung) > 300 {
+                beenden()
+            } else if let g = gehenSeit, jetzt.timeIntervalSince(g) > 90 {
+                // ausgestiegen und losgelaufen → Autofahrt fertig, ggf. Fußweg anfangen
+                beenden()
+                if automatikFuss { starten(.fuss, automatisch: true) }
+            }
+        case .fuss, .rad:
+            if jetzt.timeIntervalSince(letzteBewegung) > 300 {
+                beenden()
+            } else if jetzt.timeIntervalSince(start) > 180 && liveDistanz < 100 {
+                // nur in der Wohnung herumgelaufen → GPS wieder aus, spart Akku
+                fussPauseBis = jetzt.addingTimeInterval(600)
+                beenden()
+            }
         }
     }
 
-    /// Falls die App während einer Aufnahme beendet wurde: Fahrt trotzdem behalten.
+    /// Falls die App während einer Aufnahme beendet wurde: Strecke trotzdem behalten.
     private func abgebrocheneFahrtenRetten() {
         guard let context = container?.mainContext else { return }
         let beschreibung = FetchDescriptor<Fahrt>(predicate: #Predicate { $0.statusText == "aufnahme" })
         let offen = (try? context.fetch(beschreibung)) ?? []
         for fahrt in offen {
-            if fahrt.distanzMeter < mindestStrecke {
+            if fahrt.distanzMeter < fahrt.art.mindestStrecke {
                 context.delete(fahrt)
             } else {
                 fahrt.ende = fahrt.punkte.last.map { Date(timeIntervalSince1970: $0.zeit) } ?? fahrt.start
@@ -188,27 +229,43 @@ final class FahrtRecorder: NSObject, ObservableObject {
     }
 
     private func bewegungErkannt(_ a: CMMotionActivity) {
-        if a.automotive && a.confidence != .low {
+        let sicher = a.confidence != .low
+        if a.automotive && sicher {
             gehenSeit = nil
-            letzteBewegung = Date()
-            if !nimmtAuf && automatik { starten(automatisch: true) }
-        } else if a.walking || a.running || a.cycling {
+            if nimmtAuf && art == .auto { letzteBewegung = Date() }
+            // Vom Fußweg ins Auto gestiegen → Fußweg beenden, Autofahrt starten
+            if nimmtAuf && art == .fuss && automatischGestartet { beenden() }
+            if !nimmtAuf && automatikAuto { starten(.auto, automatisch: true) }
+        } else if (a.walking || a.running) && sicher {
             if gehenSeit == nil { gehenSeit = Date() }
+            if nimmtAuf && art == .fuss { letzteBewegung = Date() }
+            if !nimmtAuf && automatikFuss && Date() > fussPauseBis { starten(.fuss, automatisch: true) }
+        } else if a.cycling && sicher {
+            if nimmtAuf && art == .rad { letzteBewegung = Date() }
+        } else if a.stationary {
+            gehenSeit = nil
         }
     }
 
-    /// Nach einem Aufwecken durch Ortswechsel: kurz nachsehen, ob wir im Auto sitzen.
+    /// Nach einem Aufwecken durch Ortswechsel: nachsehen, ob wir fahren oder laufen.
     private func nachAufweckenPruefen(_ ort: CLLocation) {
         guard automatik, !nimmtAuf else { return }
-        if ort.speed > 8 { // über ca. 30 km/h
-            starten(automatisch: true)
+        if automatikAuto && ort.speed > 8 { // über ca. 30 km/h
+            starten(.auto, automatisch: true)
             return
         }
         guard CMMotionActivityManager.isActivityAvailable() else { return }
         bewegung.queryActivityStarting(from: Date().addingTimeInterval(-300), to: Date(), to: .main) { [weak self] liste, _ in
-            let imAuto = liste?.last?.automotive == true
+            let letzte = liste?.last(where: { $0.confidence != .low })
+            let imAuto = letzte?.automotive == true
+            let zuFuss = letzte?.walking == true || letzte?.running == true
             Task { @MainActor in
-                if imAuto { self?.starten(automatisch: true) }
+                guard let self, !self.nimmtAuf else { return }
+                if imAuto && self.automatikAuto {
+                    self.starten(.auto, automatisch: true)
+                } else if zuFuss && self.automatikFuss && Date() > self.fussPauseBis {
+                    self.starten(.fuss, automatisch: true)
+                }
             }
         }
     }
@@ -218,15 +275,17 @@ final class FahrtRecorder: NSObject, ObservableObject {
             if let letzter = orte.last { nachAufweckenPruefen(letzter) }
             return
         }
+        let bewegtAb: Double = art == .auto ? 2.5 : 0.7   // m/s
+        let maxUngenau: Double = art == .auto ? 40 : 30
         for ort in orte {
-            guard ort.horizontalAccuracy > 0, ort.horizontalAccuracy < 40 else { continue }
+            guard ort.horizontalAccuracy > 0, ort.horizontalAccuracy < maxUngenau else { continue }
             if let vorher = letzterOrt {
                 let abstand = ort.distance(from: vorher)
                 if abstand < 3 { continue }
                 liveDistanz += abstand
             }
             letzterOrt = ort
-            if ort.speed > 2.5 { letzteBewegung = Date() }
+            if ort.speed > bewegtAb { letzteBewegung = Date() }
             punkte.append(Punkt(lat: ort.coordinate.latitude,
                                 lon: ort.coordinate.longitude,
                                 zeit: ort.timestamp.timeIntervalSince1970,

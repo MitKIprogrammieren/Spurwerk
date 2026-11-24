@@ -52,11 +52,11 @@ final class Abgleich: ObservableObject {
         let alle = (try? context.fetch(FetchDescriptor<Fahrt>())) ?? []
         let offen = alle.filter { $0.status == .wartet || (auchFehler && $0.status == .fehler) }
         guard !offen.isEmpty else {
-            meldung = "Alle Fahrten sind auf der Straße"
+            meldung = "Alle Strecken sind abgeglichen"
             return
         }
         guard let server = await erreichbarerServer() else {
-            meldung = "\(offen.count) Fahrt(en) warten – Server gerade nicht erreichbar"
+            meldung = "\(offen.count) Strecke(n) warten – Server gerade nicht erreichbar"
             return
         }
 
@@ -65,7 +65,7 @@ final class Abgleich: ObservableObject {
         for fahrt in offen {
             meldung = "Gleiche ab … \(geschafft + 1) von \(offen.count)"
             do {
-                fahrt.spur = try await client.abgleichen(fahrt.punkte)
+                fahrt.spur = try await client.abgleichen(fahrt.punkte, art: fahrt.art)
                 fahrt.status = .fertig
                 fahrt.fehlertext = nil
                 geschafft += 1
@@ -75,7 +75,7 @@ final class Abgleich: ObservableObject {
             }
             try? context.save()
         }
-        meldung = "\(geschafft) von \(offen.count) Fahrten abgeglichen"
+        meldung = "\(geschafft) von \(offen.count) Strecken abgeglichen"
     }
 
     func eineAbgleichen(_ fahrt: Fahrt, container: ModelContainer) async {
@@ -96,8 +96,8 @@ struct ValhallaClient {
     /// Valhalla verträgt keine beliebig langen Spuren – darum in Stücken mit 1 Punkt Überlappung.
     private let stueckGroesse = 2000
 
-    func abgleichen(_ punkte: [Punkt]) async throws -> [CLLocationCoordinate2D] {
-        let duenn = Self.ausduennen(punkte, abstand: 15)
+    func abgleichen(_ punkte: [Punkt], art: FahrtArt) async throws -> [CLLocationCoordinate2D] {
+        let duenn = Self.ausduennen(punkte, abstand: art == .auto ? 15 : 6)
         guard duenn.count >= 2 else { throw Fehler(text: "Zu wenige GPS-Punkte") }
 
         var ergebnis: [CLLocationCoordinate2D] = []
@@ -110,7 +110,7 @@ struct ValhallaClient {
             stuecke += 1
             var linie: [CLLocationCoordinate2D]
             do {
-                linie = try await teilAbgleichen(teil)
+                linie = try await teilAbgleichen(teil, art: art)
             } catch {
                 // Stück ließ sich nicht zuordnen (z. B. Tiefgarage, Fähre): rohe Punkte behalten
                 fehlgeschlagen += 1
@@ -124,15 +124,15 @@ struct ValhallaClient {
         return ergebnis
     }
 
-    private func teilAbgleichen(_ teil: [Punkt]) async throws -> [CLLocationCoordinate2D] {
+    private func teilAbgleichen(_ teil: [Punkt], art: FahrtArt) async throws -> [CLLocationCoordinate2D] {
         let anfrageDaten: [String: Any] = [
             "shape": teil.map { ["lat": $0.lat, "lon": $0.lon, "time": Int($0.zeit)] },
-            "costing": "auto",
+            "costing": art.valhallaProfil,
             "shape_match": "map_snap",
             "use_timestamps": true,
             "directions_type": "none",
             "trace_options": [
-                "search_radius": 40,
+                "search_radius": art == .auto ? 40 : 25,
                 "gps_accuracy": 10,
                 "breakage_distance": 3000,
                 "interpolation_distance": 10

@@ -6,15 +6,25 @@ struct FahrtenListe: View {
     @Query(sort: \Fahrt.start, order: .reverse) private var fahrten: [Fahrt]
     @Environment(\.modelContext) private var context
 
-    private var gesamt: Double { fahrten.reduce(0) { $0 + $1.distanzMeter } }
+    private func gesamt(_ art: FahrtArt) -> Double {
+        fahrten.filter { $0.art == art }.reduce(0) { $0 + $1.distanzMeter }
+    }
 
     var body: some View {
         NavigationStack {
             List {
                 if !fahrten.isEmpty {
                     Section {
-                        LabeledContent("Fahrten", value: "\(fahrten.count)")
-                        LabeledContent("Gesamtstrecke", value: Format.km(gesamt))
+                        ForEach(FahrtArt.allCases) { art in
+                            let strecke = gesamt(art)
+                            if strecke > 0 {
+                                LabeledContent {
+                                    Text(Format.km(strecke))
+                                } label: {
+                                    Label(art.name, systemImage: art.symbol).foregroundStyle(art.farbe)
+                                }
+                            }
+                        }
                     }
                 }
                 Section {
@@ -34,10 +44,10 @@ struct FahrtenListe: View {
                     }
                 }
             }
-            .navigationTitle("Fahrten")
+            .navigationTitle("Strecken")
             .overlay {
                 if fahrten.isEmpty {
-                    ContentUnavailableView("Noch keine Fahrten",
+                    ContentUnavailableView("Noch keine Strecken",
                                            systemImage: "car",
                                            description: Text("Tippe auf der Karte auf „Start“ oder lass die Automatik laufen."))
                 }
@@ -50,7 +60,10 @@ struct FahrtZeile: View {
     let fahrt: Fahrt
 
     var body: some View {
-        HStack {
+        HStack(spacing: 12) {
+            Image(systemName: fahrt.art.symbol)
+                .foregroundStyle(fahrt.art.farbe)
+                .frame(width: 26)
             VStack(alignment: .leading, spacing: 3) {
                 Text(fahrt.start.formatted(.dateTime.weekday(.abbreviated).day().month(.abbreviated).hour().minute()))
                     .font(.headline)
@@ -95,7 +108,7 @@ struct FahrtDetail: View {
             Map(initialPosition: .automatic) {
                 if let spur, spur.count > 1 {
                     MapPolyline(coordinates: spur)
-                        .stroke(Color.teal, style: StrokeStyle(lineWidth: 5, lineCap: .round, lineJoin: .round))
+                        .stroke(fahrt.art.farbe, style: StrokeStyle(lineWidth: 5, lineCap: .round, lineJoin: .round))
                 }
                 if rohZeigen || spur == nil, roh.count > 1 {
                     MapPolyline(coordinates: roh)
@@ -111,6 +124,7 @@ struct FahrtDetail: View {
             .mapStyle(.standard(pointsOfInterest: .excludingAll))
 
             List {
+                LabeledContent("Art") { Label(fahrt.art.name, systemImage: fahrt.art.symbol) }
                 LabeledContent("Strecke", value: Format.km(fahrt.distanzMeter))
                 LabeledContent("Dauer", value: Format.dauer(fahrt.dauer))
                 LabeledContent("Status") { StatusMarke(status: fahrt.status) }

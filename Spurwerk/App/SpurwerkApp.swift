@@ -35,7 +35,7 @@ struct HauptView: View {
             KartenView()
                 .tabItem { Label("Karte", systemImage: "map") }
             FahrtenListe()
-                .tabItem { Label("Fahrten", systemImage: "car") }
+                .tabItem { Label("Strecken", systemImage: "point.topleft.down.to.point.bottomright.curvepath") }
             EinstellungenView()
                 .tabItem { Label("Einstellungen", systemImage: "gearshape") }
         }

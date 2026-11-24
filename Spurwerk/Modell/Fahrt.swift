@@ -18,6 +18,47 @@ enum FahrtStatus: String {
     case fehler     // Abgleich fehlgeschlagen
 }
 
+/// Womit die Strecke zurückgelegt wurde – bestimmt Farbe und welche Wege Valhalla benutzen darf.
+enum FahrtArt: String, CaseIterable, Identifiable {
+    case auto, fuss, rad
+
+    var id: String { rawValue }
+
+    var name: String {
+        switch self {
+        case .auto: "Auto"
+        case .fuss: "Zu Fuß"
+        case .rad: "Fahrrad"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .auto: "car.fill"
+        case .fuss: "figure.walk"
+        case .rad: "bicycle"
+        }
+    }
+
+    /// Profil für Valhalla: Fußgänger dürfen Gehwege und Pfade, Autos nur Straßen.
+    var valhallaProfil: String {
+        switch self {
+        case .auto: "auto"
+        case .fuss: "pedestrian"
+        case .rad: "bicycle"
+        }
+    }
+
+    /// Kürzere Strecken werden verworfen (z. B. der Weg zum Briefkasten).
+    var mindestStrecke: Double {
+        switch self {
+        case .auto: 300
+        case .fuss: 150
+        case .rad: 200
+        }
+    }
+}
+
 @Model
 final class Fahrt {
     var id: UUID = UUID()
@@ -28,9 +69,16 @@ final class Fahrt {
     var distanzMeter: Double = 0
     var statusText: String = FahrtStatus.aufnahme.rawValue
     var fehlertext: String?
+    var artText: String = "auto"
 
-    init(start: Date) {
+    init(start: Date, art: FahrtArt = .auto) {
         self.start = start
+        self.artText = art.rawValue
+    }
+
+    var art: FahrtArt {
+        get { FahrtArt(rawValue: artText) ?? .auto }
+        set { artText = newValue.rawValue }
     }
 
     var status: FahrtStatus {

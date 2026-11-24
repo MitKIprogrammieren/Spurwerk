@@ -20,9 +20,14 @@ struct EinstellungenView: View {
         NavigationStack {
             Form {
                 Section {
-                    Toggle("Fahrten automatisch aufzeichnen", isOn: Binding(
-                        get: { recorder.automatik },
-                        set: { recorder.automatik = $0 }))
+                    Toggle(isOn: Binding(get: { recorder.automatikAuto },
+                                         set: { recorder.automatikAuto = $0 })) {
+                        Label("Autofahrten automatisch", systemImage: "car.fill")
+                    }
+                    Toggle(isOn: Binding(get: { recorder.automatikFuss },
+                                         set: { recorder.automatikFuss = $0 })) {
+                        Label("Fußwege automatisch", systemImage: "figure.walk")
+                    }
                     LabeledContent("Standortzugriff", value: berechtigungText)
                     if recorder.berechtigung != .authorizedAlways {
                         Button("Standort „Immer“ erlauben") {
@@ -38,7 +43,7 @@ struct EinstellungenView: View {
                 } header: {
                     Text("Aufzeichnung")
                 } footer: {
-                    Text("Für die Automatik braucht die App „Immer“. Sie startet, sobald das iPhone eine Autofahrt erkennt, und stoppt nach 5 Minuten Stillstand oder wenn du losläufst.")
+                    Text("Für die Automatik braucht die App „Immer“. Sie startet, sobald das iPhone erkennt, dass du fährst oder läufst, und stoppt nach 5 Minuten Stillstand. Wege unter 100 m (z. B. in der Wohnung) werden verworfen. Fahrrad startest du von Hand.")
                 }
 
                 Section {
@@ -49,7 +54,7 @@ struct EinstellungenView: View {
                     Button("Verbindung testen") {
                         Task { await abgleich.verbindungTesten() }
                     }
-                    Button("Alle offenen Fahrten jetzt abgleichen") {
+                    Button("Alle offenen Strecken jetzt abgleichen") {
                         guard let container = recorder.container else { return }
                         Task { await abgleich.ausstehendeAbgleichen(container: container, auchFehler: true) }
                     }
@@ -60,7 +65,7 @@ struct EinstellungenView: View {
                 } header: {
                     Text("Kartendienst auf dem NUC")
                 } footer: {
-                    Text("Die App probiert erst das Heimnetz, dann Tailscale. Ist keiner erreichbar, wartet die Fahrt und wird später abgeglichen.")
+                    Text("Die App probiert erst das Heimnetz, dann Tailscale. Ist keiner erreichbar, wartet die Strecke und wird später abgeglichen. Fußwege werden auf Geh- und Feldwege gelegt, Autofahrten nur auf Straßen.")
                 }
             }
             .navigationTitle("Einstellungen")
