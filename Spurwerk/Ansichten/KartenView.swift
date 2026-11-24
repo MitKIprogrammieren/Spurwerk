@@ -77,6 +77,7 @@ final class SpurCache: ObservableObject {
         let ende: Date
         let distanz: Double
         let linie: MKPolyline
+        let fein: [CLLocationCoordinate2D]
         let grob: [CLLocationCoordinate2D]
         let anfang: CLLocationCoordinate2D
         let ziel: CLLocationCoordinate2D
@@ -92,6 +93,7 @@ final class SpurCache: ObservableObject {
         let ende: Date
         let distanz: Double
         let daten: Data
+        let roh: Data
     }
 
     private var eintraege: [UUID: Eintrag] = [:]
@@ -131,19 +133,23 @@ final class SpurCache: ObservableObject {
                 let daten = abgeglichen ? (f.spurDaten ?? Data()) : f.rohDaten
                 neu.append(Roh(id: f.id, kennung: kennung, art: f.art, abgeglichen: abgeglichen,
                                geschaetzt: f.geschaetzt, start: f.start, ende: f.ende ?? f.start,
-                               distanz: f.distanzMeter, daten: daten))
+                               distanz: f.distanzMeter, daten: daten, roh: abgeglichen ? f.rohDaten : Data()))
             }
             var fertig: [(UUID, Eintrag)] = []
             fertig.reserveCapacity(neu.count)
             for r in neu {
                 let punkte = r.abgeglichen ? Koordinaten.ausDaten(r.daten) : SpurCache.rohPunkte(r.daten)
-                guard punkte.count > 1, let anfang = punkte.first, let ziel = punkte.last else { continue }
+                guard punkte.count > 1 else { continue }
+                // Für Halte und Parkplätze zählen die echten Aufzeichnungspunkte: Der Straßenabgleich
+                // zieht das Ende sonst gern auf die nächste Straße, z. B. die Autobahn neben dem Haus.
+                let echt = r.abgeglichen ? SpurCache.rohPunkte(r.roh) : punkte
+                guard let anfang = echt.first ?? punkte.first, let ziel = echt.last ?? punkte.last else { continue }
                 let einfach = Vereinfachen.linie(punkte, toleranzMeter: 5)
                 let linie = MKPolyline(coordinates: einfach, count: einfach.count)
                 let grob = Vereinfachen.linie(einfach, toleranzMeter: 35)
                 fertig.append((r.id, Eintrag(kennung: r.kennung, art: r.art, abgeglichen: r.abgeglichen,
                                              geschaetzt: r.geschaetzt, start: r.start, ende: r.ende,
-                                             distanz: r.distanz, linie: linie, grob: grob, anfang: anfang, ziel: ziel)))
+                                             distanz: r.distanz, linie: linie, fein: einfach, grob: grob, anfang: anfang, ziel: ziel)))
             }
             let gueltigFest = gueltig
             await MainActor.run {
@@ -227,49 +233,46 @@ final class SpurCache: ObservableObject {
         }
     }
 
-    /// Genaue Linien, aufgeteilt in Kacheln von etwa 15 × 17 km.
+    /// Genaue Linien: doppelte Straßenstücke fallen weg (Raster etwa 25 m), der Rest wird in
+    /// Kacheln von etwa 7 × 7 km aufgeteilt, damit MapKit nur zeichnet, was zu sehen ist.
     nonisolated static func feinBauen(_ liste: [(UUID, Eintrag)]) -> [SpurGruppe] {
-        var teile: [String: (art: FahrtArt, abgeglichen: Bool, geschaetzt: Bool, ids: [UUID], linien: [MKPolyline])] = [:]
-        for (id, e) in liste {
-            let r = e.linie.boundingMapRect
-            let mitte = MKMapPoint(x: r.midX, y: r.midY).coordinate
-            let kx = Int((mitte.longitude / 0.25).rounded(.down))
-            let ky = Int((mitte.latitude / 0.15).rounded(.down))
-            let s = "f-\(e.art.rawValue)-\(e.abgeglichen)-\(e.geschaetzt)-\(kx)-\(ky)"
-            teile[s, default: (e.art, e.abgeglichen, e.geschaetzt, [], [])].ids.append(id)
-            teile[s]!.linien.append(e.linie)
-        }
-        return teile.map { schluessel, t in
-            var hasher = Hasher()
-            for id in t.ids.sorted(by: { $0.uuidString < $1.uuidString }) { hasher.combine(id) }
-            return SpurGruppe(art: t.art, abgeglichen: t.abgeglichen, geschaetzt: t.geschaetzt,
-                              schluessel: "\(schluessel)-\(t.ids.count)-\(hasher.finalize())", linien: t.linien)
-        }
+        entdoppeln(liste.map(\.1), punkte: \.fein, gLat: 0.00023, gLon: 0.00037, kachel: (0.1, 0.06), praefix: "f")
     }
 
-    /// Weite Ansicht: Wer 500-mal dieselbe Straße fährt, bekommt sie nur einmal gezeichnet.
-    /// Dafür wird die Karte in ein Raster von etwa 120 m geteilt; Abschnitte, deren Rasterfelder
-    /// schon von einer anderen Strecke derselben Art belegt sind, fallen weg.
+    /// Weite Ansicht: grob vereinfacht, Raster etwa 120 m, eine Gruppe je Art und Zustand.
     nonisolated static func grobBauen(_ liste: [(UUID, Eintrag)]) -> [SpurGruppe] {
-        let gLat = 0.0011
-        let gLon = 0.0018
+        entdoppeln(liste.map(\.1), punkte: \.grob, gLat: 0.0011, gLon: 0.0018, kachel: nil, praefix: "g")
+    }
+
+    /// Wer 500-mal dieselbe Straße fährt, bekommt sie nur einmal gezeichnet: Die Karte wird in ein
+    /// Raster geteilt; Abschnitte, deren Rasterfelder schon von einer anderen Strecke derselben Art
+    /// belegt sind, fallen weg. Fertig abgeglichene Strecken haben Vorrang vor geschätzten und rohen.
+    nonisolated static func entdoppeln(_ eintraege: [Eintrag], punkte: KeyPath<Eintrag, [CLLocationCoordinate2D]>,
+                                       gLat: Double, gLon: Double, kachel: (Double, Double)?, praefix: String) -> [SpurGruppe] {
         func rang(_ e: Eintrag) -> Int { e.abgeglichen ? (e.geschaetzt ? 1 : 0) : 2 }
-        let sortiert = liste.map(\.1).sorted { rang($0) < rang($1) }
+        let sortiert = eintraege.sorted { rang($0) == rang($1) ? $0.start > $1.start : rang($0) < rang($1) }
 
         var belegt: [FahrtArt: Set<Int64>] = [:]
         var teile: [String: (art: FahrtArt, abgeglichen: Bool, geschaetzt: Bool, linien: [MKPolyline], punkte: Int)] = [:]
+        var eigene: [Int64] = []
+        var lauf: [CLLocationCoordinate2D] = []
 
         for e in sortiert {
-            let p = e.grob
+            let p = e[keyPath: punkte]
             guard p.count > 1 else { continue }
-            let schon = belegt[e.art] ?? []
-            var eigene: [Int64] = []
-            var lauf: [CLLocationCoordinate2D] = []
-            let s = "g-\(e.art.rawValue)-\(e.abgeglichen)-\(e.geschaetzt)"
-            if teile[s] == nil { teile[s] = (e.art, e.abgeglichen, e.geschaetzt, [], 0) }
+            // Menge herausnehmen, damit sie beim Ergänzen nicht jedes Mal kopiert wird
+            var schon = belegt.removeValue(forKey: e.art) ?? []
+            eigene.removeAll(keepingCapacity: true)
+            lauf.removeAll(keepingCapacity: true)
+            let basis = "\(praefix)-\(e.art.rawValue)-\(e.abgeglichen)-\(e.geschaetzt)"
 
             func abschliessen() {
                 if lauf.count > 1 {
+                    var s = basis
+                    if let (kx, ky) = kachel {
+                        s += "-\(Int((lauf[0].longitude / kx).rounded(.down)))-\(Int((lauf[0].latitude / ky).rounded(.down)))"
+                    }
+                    if teile[s] == nil { teile[s] = (e.art, e.abgeglichen, e.geschaetzt, [], 0) }
                     teile[s]!.linien.append(MKPolyline(coordinates: lauf, count: lauf.count))
                     teile[s]!.punkte += lauf.count
                 }
@@ -278,16 +281,16 @@ final class SpurCache: ObservableObject {
 
             for i in 1..<p.count {
                 let a = p[i - 1], b = p[i]
-                let schritte = max(1, Int(max(abs(b.latitude - a.latitude) / gLat,
-                                              abs(b.longitude - a.longitude) / gLon).rounded(.up)))
+                let schritte = min(2000, max(1, Int(max(abs(b.latitude - a.latitude) / gLat,
+                                                        abs(b.longitude - a.longitude) / gLon).rounded(.up))))
                 var neu = false
                 for k in 0...schritte {
                     let t = Double(k) / Double(schritte)
                     let la = a.latitude + (b.latitude - a.latitude) * t
                     let lo = a.longitude + (b.longitude - a.longitude) * t
-                    let feld = Int64((la / gLat).rounded(.down)) * 1_000_000 + Int64((lo / gLon).rounded(.down) + 500_000)
+                    let feld = Int64((la / gLat).rounded(.down)) * 10_000_000 + Int64((lo / gLon).rounded(.down) + 5_000_000)
                     eigene.append(feld)
-                    if !schon.contains(feld) { neu = true }
+                    if !neu, !schon.contains(feld) { neu = true }
                 }
                 if neu {
                     if lauf.isEmpty { lauf.append(a) }
@@ -297,12 +300,15 @@ final class SpurCache: ObservableObject {
                 }
             }
             abschliessen()
-            belegt[e.art, default: []].formUnion(eigene)
+            schon.formUnion(eigene)
+            belegt[e.art] = schon
         }
         return teile.compactMap { schluessel, t in
             guard !t.linien.isEmpty else { return nil }
+            var hasher = Hasher()
+            for l in t.linien.prefix(50) { hasher.combine(l.coordinate.latitude); hasher.combine(l.coordinate.longitude) }
             return SpurGruppe(art: t.art, abgeglichen: t.abgeglichen, geschaetzt: t.geschaetzt,
-                              schluessel: "\(schluessel)-\(t.linien.count)-\(t.punkte)", linien: t.linien)
+                              schluessel: "\(schluessel)-\(t.linien.count)-\(t.punkte)-\(hasher.finalize())", linien: t.linien)
         }
     }
 
