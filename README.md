@@ -7,7 +7,9 @@ iPhone-App, die aufzeichnet, wo du gefahren und gelaufen bist – sauber auf Str
 - **Auf die Straße legen:** Die rohen GPS-Punkte gehen an Valhalla auf dem Proxmox-NUC (Map-Matching mit OpenStreetMap).
   Erst Heimnetz (`http://192.168.1.30:8002`), sonst Tailscale. Ist nichts erreichbar, wartet die Fahrt.
 - **Karte:** alle Fahrten übereinander (türkis = Auto, lila = zu Fuß, rot = Rad; gestrichelt = wartet noch auf Abgleich), oben filterbar.
-- **Export:** jede Fahrt als GPX.
+- **Export:** jede Strecke als GPX.
+- **Google-Zeitachse importieren:** Export aus der Google-Maps-App (iPhone- und Android-Format sowie alter Takeout) einlesen – Auto-, Fuß- und Radstrecken werden übernommen und ebenfalls auf die Straßen gelegt.
+- **Aussehen:** gedämpfte Karte mit leuchtenden Linien, Tageskarte mit heutigen Kilometern, Dunkel/Hell/System wählbar.
 
 ## Bauen (Mac)
 

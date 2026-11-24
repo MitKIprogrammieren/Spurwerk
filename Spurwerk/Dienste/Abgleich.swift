@@ -99,6 +99,10 @@ struct ValhallaClient {
     func abgleichen(_ punkte: [Punkt], art: FahrtArt) async throws -> [CLLocationCoordinate2D] {
         let duenn = Self.ausduennen(punkte, abstand: art == .auto ? 15 : 6)
         guard duenn.count >= 2 else { throw Fehler(text: "Zu wenige GPS-Punkte") }
+        // Importierte Google-Daten haben oft nur alle paar hundert Meter einen Punkt.
+        // Dann lässt Valhalla die Lücken über das Straßennetz routen statt sie zu verbinden.
+        let luecke = Self.mittlererAbstand(duenn)
+        let duennBesetzt = luecke > 150
 
         var ergebnis: [CLLocationCoordinate2D] = []
         var fehlgeschlagen = 0
@@ -110,7 +114,7 @@ struct ValhallaClient {
             stuecke += 1
             var linie: [CLLocationCoordinate2D]
             do {
-                linie = try await teilAbgleichen(teil, art: art)
+                linie = try await teilAbgleichen(teil, art: art, duennBesetzt: duennBesetzt)
             } catch {
                 // Stück ließ sich nicht zuordnen (z. B. Tiefgarage, Fähre): rohe Punkte behalten
                 fehlgeschlagen += 1
@@ -124,17 +128,17 @@ struct ValhallaClient {
         return ergebnis
     }
 
-    private func teilAbgleichen(_ teil: [Punkt], art: FahrtArt) async throws -> [CLLocationCoordinate2D] {
+    private func teilAbgleichen(_ teil: [Punkt], art: FahrtArt, duennBesetzt: Bool) async throws -> [CLLocationCoordinate2D] {
         let anfrageDaten: [String: Any] = [
             "shape": teil.map { ["lat": $0.lat, "lon": $0.lon, "time": Int($0.zeit)] },
             "costing": art.valhallaProfil,
             "shape_match": "map_snap",
-            "use_timestamps": true,
+            "use_timestamps": !duennBesetzt,
             "directions_type": "none",
             "trace_options": [
-                "search_radius": art == .auto ? 40 : 25,
-                "gps_accuracy": 10,
-                "breakage_distance": 3000,
+                "search_radius": duennBesetzt ? 60 : (art == .auto ? 40 : 25),
+                "gps_accuracy": duennBesetzt ? 30 : 10,
+                "breakage_distance": duennBesetzt ? 10000 : 3000,
                 "interpolation_distance": 10
             ]
         ]
@@ -158,6 +162,17 @@ struct ValhallaClient {
             }
         }
         return linie
+    }
+
+    static func mittlererAbstand(_ punkte: [Punkt]) -> Double {
+        guard punkte.count > 1 else { return 0 }
+        var summe = 0.0
+        for i in 1..<punkte.count {
+            let a = CLLocation(latitude: punkte[i - 1].lat, longitude: punkte[i - 1].lon)
+            let b = CLLocation(latitude: punkte[i].lat, longitude: punkte[i].lon)
+            summe += a.distance(from: b)
+        }
+        return summe / Double(punkte.count - 1)
     }
 
     static func ausduennen(_ punkte: [Punkt], abstand: Double) -> [Punkt] {

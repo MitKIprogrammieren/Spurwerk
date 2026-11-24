@@ -29,6 +29,15 @@ struct SpurwerkApp: App {
 struct HauptView: View {
     @Environment(\.scenePhase) private var phase
     @EnvironmentObject private var recorder: FahrtRecorder
+    @AppStorage("erscheinung") private var erscheinung = "dunkel"
+
+    private var schema: ColorScheme? {
+        switch erscheinung {
+        case "dunkel": .dark
+        case "hell": .light
+        default: nil
+        }
+    }
 
     var body: some View {
         TabView {
@@ -40,6 +49,7 @@ struct HauptView: View {
                 .tabItem { Label("Einstellungen", systemImage: "gearshape") }
         }
         .tint(.teal)
+        .preferredColorScheme(schema)
         .onChange(of: phase) { _, neu in
             guard neu == .active, let container = recorder.container else { return }
             Task { await Abgleich.shared.ausstehendeAbgleichen(container: container) }

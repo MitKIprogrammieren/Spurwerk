@@ -71,6 +71,9 @@ struct FahrtZeile: View {
                     .font(.subheadline).foregroundStyle(.secondary)
             }
             Spacer()
+            if fahrt.quelle == "google" {
+                Image(systemName: "clock.arrow.circlepath").foregroundStyle(.secondary).font(.caption)
+            }
             StatusMarke(status: fahrt.status)
         }
     }
@@ -126,6 +129,9 @@ struct FahrtDetail: View {
             List {
                 LabeledContent("Art") { Label(fahrt.art.name, systemImage: fahrt.art.symbol) }
                 LabeledContent("Strecke", value: Format.km(fahrt.distanzMeter))
+                if fahrt.quelle == "google" {
+                    LabeledContent("Quelle", value: "Google-Zeitachse")
+                }
                 LabeledContent("Dauer", value: Format.dauer(fahrt.dauer))
                 LabeledContent("Status") { StatusMarke(status: fahrt.status) }
                 if let fehler = fahrt.fehlertext {

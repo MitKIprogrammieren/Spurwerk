@@ -70,6 +70,8 @@ final class Fahrt {
     var statusText: String = FahrtStatus.aufnahme.rawValue
     var fehlertext: String?
     var artText: String = "auto"
+    /// „app“ = selbst aufgezeichnet, „google“ = aus der Google-Zeitachse importiert
+    var quelle: String = "app"
 
     init(start: Date, art: FahrtArt = .auto) {
         self.start = start
