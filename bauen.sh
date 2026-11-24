@@ -12,6 +12,11 @@ mkdir Payload
 cp -R build/Build/Products/Release-iphoneos/Spurwerk.app Payload/
 zip -qr Spurwerk.ipa Payload
 rm -rf Payload
+# Logo für den Bau-Knopf auf dem Schreibtisch (geht verloren, wenn die Datei neu geschrieben wird)
+KNOPF="$HOME/Desktop/Spurwerk bauen.command"
+if [ -f "$KNOPF" ] && [ -f Spurwerk-bauen-Icon.png ]; then
+  osascript -l JavaScript -e "ObjC.import('AppKit'); \$.NSWorkspace.sharedWorkspace.setIconForFileOptions(\$.NSImage.alloc.initWithContentsOfFile('$(pwd)/Spurwerk-bauen-Icon.png'), '$KNOPF', 0)" >/dev/null 2>&1 || true
+fi
 # Gleich in iCloud Drive legen – dann auf dem iPhone in SideStore über „+“ → iCloud Drive auswählen
 ICLOUD="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
 if [ -d "$ICLOUD" ]; then
