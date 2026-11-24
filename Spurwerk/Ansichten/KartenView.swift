@@ -174,11 +174,7 @@ final class SpurCache: ObservableObject {
                                startLat: $0.value.anfang.latitude, startLon: $0.value.anfang.longitude,
                                zielLat: $0.value.ziel.latitude, zielLon: $0.value.ziel.longitude) }
             .sorted { $0.start < $1.start }
-        let orte = OrtNamen.shared
-        alleHalte = Halt.berechnen(stuecke).map { h in
-            guard let (lat, lon) = orte.einrasten(h.lat, h.lon) else { return h }
-            return Halt(nachFahrt: h.nachFahrt, lat: lat, lon: lon, von: h.von, bis: h.bis, parken: h.parken)
-        }
+        alleHalte = Halt.berechnen(stuecke)
         var nach: [UUID: Halt] = [:]
         for h in alleHalte { nach[h.nachFahrt] = h }
         halteNach = nach
@@ -425,7 +421,6 @@ struct KartenView: View {
                 if zoomWunsch { zoomWunsch = false; zoomNr += 1 }
             }
             .onChange(of: abgleich.version) { _, _ in cache.aktualisieren(container: recorder.container) }
-            .onChange(of: namen.orteVersion) { _, _ in cache.halteNeu() }
             .onChange(of: recorder.nimmtAuf) { _, _ in cache.aktualisieren(container: recorder.container) }
     }
 }

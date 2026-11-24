@@ -87,16 +87,17 @@ enum GoogleImport {
             var punkte = a.punkte.map {
                 Punkt(lat: $0.lat, lon: $0.lon, zeit: $0.zeit.timeIntervalSince1970, genauigkeit: 50, tempo: -1)
             }
-            // Google lässt Fahrten oft ein Stück vor dem Ziel enden (oder nach dem Start beginnen).
-            // Der Aufenthalt direkt danach bzw. davor zeigt, wo es wirklich war.
+            // Google lässt Fahrten manchmal weit vor dem Ziel enden (z. B. noch auf der Autobahn).
+            // Nur bei großen Lücken (ab 300 m) gilt der Aufenthalt direkt danach bzw. davor –
+            // dessen Ort ist bei Google nur ein vermuteter Platz, bei kleinen Abständen ist der eigene Punkt genauer.
             if let b = aufenthalte.first(where: { $0.start >= a.ende.addingTimeInterval(-300) && $0.start <= a.ende.addingTimeInterval(900) }),
                let letzter = punkte.last,
-               (20...3000).contains(Halt.meter(letzter.lat, letzter.lon, b.lat, b.lon)) {
+               (300...3000).contains(Halt.meter(letzter.lat, letzter.lon, b.lat, b.lon)) {
                 punkte.append(Punkt(lat: b.lat, lon: b.lon, zeit: a.ende.timeIntervalSince1970 + 1, genauigkeit: 30, tempo: -1))
             }
             if let b = aufenthalte.last(where: { $0.ende <= a.start.addingTimeInterval(300) && $0.ende >= a.start.addingTimeInterval(-900) }),
                let erster = punkte.first,
-               (20...3000).contains(Halt.meter(erster.lat, erster.lon, b.lat, b.lon)) {
+               (300...3000).contains(Halt.meter(erster.lat, erster.lon, b.lat, b.lon)) {
                 punkte.insert(Punkt(lat: b.lat, lon: b.lon, zeit: a.start.timeIntervalSince1970 - 1, genauigkeit: 30, tempo: -1), at: 0)
             }
             let distanz = a.distanz > 0 ? a.distanz : luftlinie(punkte)

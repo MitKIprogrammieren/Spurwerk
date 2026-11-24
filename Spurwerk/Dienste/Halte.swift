@@ -158,21 +158,6 @@ final class OrtNamen: ObservableObject {
     /// Zählt hoch, wenn neue Google-Orte dazukommen (dann Halte neu einrasten).
     @Published private(set) var orteVersion = 0
 
-    /// Liegt ein Ort, an dem Google dich gesehen hat, in der Nähe (600 m), gilt dessen Position.
-    /// Google-Strecken enden oft ein Stück vor dem eigentlichen Ziel, z. B. noch auf der Autobahn.
-    func einrasten(_ lat: Double, _ lon: Double) -> (Double, Double)? {
-        let kx = cos(lat * .pi / 180) * 111_320
-        var bester: (Double, OrtBesuch)?
-        for b in besuche {
-            let dy = (b.lat - lat) * 111_320
-            guard abs(dy) < 600 else { continue }
-            let dx = (b.lon - lon) * kx
-            let d = dx * dx + dy * dy
-            if d < 600 * 600, d < (bester?.0 ?? .infinity) { bester = (d, b) }
-        }
-        return bester.map { ($0.1.lat, $0.1.lon) }
-    }
-
     private func bekannterOrt(_ lat: Double, _ lon: Double) -> String? {
         let kx = cos(lat * .pi / 180) * 111_320
         var bester: (Double, String)?
