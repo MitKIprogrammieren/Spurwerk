@@ -53,15 +53,9 @@ final class Abgleich: ObservableObject {
         laeuft = true
         defer { laeuft = false; geaendert() }
 
-        let context = container.mainContext
-        // Nur offene Strecken holen – nicht den ganzen Bestand
-        let wartet = FetchDescriptor<Fahrt>(predicate: #Predicate { $0.statusText == "wartet" },
-                                            sortBy: [SortDescriptor(\.start, order: .reverse)])
-        var offen = (try? context.fetch(wartet)) ?? []
-        if auchFehler {
-            let fehler = FetchDescriptor<Fahrt>(predicate: #Predicate { $0.statusText == "fehler" })
-            offen += (try? context.fetch(fehler)) ?? []
-        }
+        // Lesen und Speichern passiert in einem eigenen Hintergrund-Kontext – die Oberfläche bleibt frei
+        let arbeiter = AbgleichArbeiter(modelContainer: container)
+        let offen = await arbeiter.offeneIDs(auchFehler: auchFehler)
         guard !offen.isEmpty else {
             meldung = "Alle Strecken sind abgeglichen"
             return
@@ -73,31 +67,25 @@ final class Abgleich: ObservableObject {
 
         let client = ValhallaClient(basis: server)
         var geschafft = 0
-        var seitAnzeige = 0
-        for (nr, fahrt) in offen.enumerated() {
-            meldung = "Lege Strecken auf die Straße … \(nr + 1) von \(offen.count)"
-            let daten = fahrt.rohDaten
-            let art = fahrt.art
+        var letzteAnzeige = Date()
+        for (nr, id) in offen.enumerated() {
+            if nr % 10 == 0 { meldung = "Lege Strecken auf die Straße … \(nr + 1) von \(offen.count)" }
+            guard let (punkte, art) = await arbeiter.punkte(id) else { continue }
             do {
-                // Entpacken und Abgleich laufen nicht auf dem Hauptthread
-                let spur = try await Task.detached(priority: .utility) {
-                    let punkte = (try? JSONDecoder().decode([Punkt].self, from: daten)) ?? []
-                    return try await client.abgleichen(punkte, art: art)
-                }.value
-                fahrt.spur = spur
-                fahrt.status = .fertig
-                fahrt.fehlertext = nil
+                let spur = try await client.abgleichen(punkte, art: art)
+                await arbeiter.ergebnis(id, spur: spur, fehler: nil)
                 geschafft += 1
             } catch {
-                fahrt.status = .fehler
-                fahrt.fehlertext = error.localizedDescription
+                await arbeiter.ergebnis(id, spur: nil, fehler: error.localizedDescription)
             }
-            try? context.save()
-            seitAnzeige += 1
-            // Karte nicht nach jeder einzelnen Strecke neu zeichnen
-            if seitAnzeige >= 25 { seitAnzeige = 0; geaendert() }
-            await Task.yield()
+            // Karte höchstens alle 30 Sekunden auffrischen
+            if Date().timeIntervalSince(letzteAnzeige) > 30 {
+                await arbeiter.sichern()
+                letzteAnzeige = Date()
+                geaendert()
+            }
         }
+        await arbeiter.sichern()
         meldung = "\(geschafft) von \(offen.count) Strecken abgeglichen"
     }
 
@@ -105,6 +93,47 @@ final class Abgleich: ObservableObject {
         fahrt.status = .wartet
         try? container.mainContext.save()
         await ausstehendeAbgleichen(container: container)
+    }
+}
+
+/// Arbeitet mit einem eigenen Datenbank-Kontext im Hintergrund.
+@ModelActor
+actor AbgleichArbeiter {
+    private var ungesichert = 0
+
+    func offeneIDs(auchFehler: Bool) -> [PersistentIdentifier] {
+        let wartet = FetchDescriptor<Fahrt>(predicate: #Predicate { $0.statusText == "wartet" },
+                                            sortBy: [SortDescriptor(\.start, order: .reverse)])
+        var ids = (try? modelContext.fetchIdentifiers(wartet)) ?? []
+        if auchFehler {
+            let fehler = FetchDescriptor<Fahrt>(predicate: #Predicate { $0.statusText == "fehler" })
+            ids += (try? modelContext.fetchIdentifiers(fehler)) ?? []
+        }
+        return ids
+    }
+
+    func punkte(_ id: PersistentIdentifier) -> ([Punkt], FahrtArt)? {
+        guard let f = modelContext.model(for: id) as? Fahrt else { return nil }
+        return (f.punkte, f.art)
+    }
+
+    func ergebnis(_ id: PersistentIdentifier, spur: [CLLocationCoordinate2D]?, fehler: String?) {
+        guard let f = modelContext.model(for: id) as? Fahrt else { return }
+        if let spur {
+            f.spur = spur
+            f.status = .fertig
+            f.fehlertext = nil
+        } else {
+            f.status = .fehler
+            f.fehlertext = fehler
+        }
+        ungesichert += 1
+        if ungesichert >= 25 { sichern() }
+    }
+
+    func sichern() {
+        try? modelContext.save()
+        ungesichert = 0
     }
 }
 

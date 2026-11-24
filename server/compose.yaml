@@ -1,0 +1,707 @@
+services:
+  spurwerk:
+    image: python:3.12-alpine
+    command: ["python", "-u", "/srv/server.py"]
+    restart: unless-stopped
+    ports:
+      - "8084:8088"
+    volumes:
+      - /opt/stacks/spurwerk/daten:/data
+    environment:
+      - TZ=Europe/Berlin
+      - PORT=8088
+      - VALHALLA=http://192.168.1.30:8002
+      - SPURWERK_DB=/data/spurwerk.sqlite
+    configs:
+      - source: server
+        target: /srv/server.py
+      - source: seite
+        target: /srv/index.html
+    mem_limit: 1g
+    init: true
+
+configs:
+  server:
+    content: |
+      #!/usr/bin/env python3
+      """Spurwerk-Server – speichert alle Strecken, legt sie mit Valhalla auf die Straße und zeigt sie im Browser.
+
+      Das iPhone lädt neue Strecken hoch (/api/hochladen) und holt fertige Linien ab (/api/abholen).
+      Der Abgleich läuft hier im Hintergrund, das iPhone muss dafür nicht offen sein.
+      """
+      import json
+      import math
+      import os
+      import sqlite3
+      import threading
+      import time
+      import urllib.error
+      import urllib.request
+      from datetime import datetime
+      from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+      from urllib.parse import parse_qs, urlparse
+
+      PORT = int(os.environ.get("PORT", "8088"))
+      DB = os.environ.get("SPURWERK_DB", "/data/spurwerk.sqlite")
+      VALHALLA = os.environ.get("VALHALLA", "http://192.168.1.30:8002").rstrip("/")
+      TOKEN = os.environ.get("SPURWERK_TOKEN", "")
+      HERE = os.path.dirname(os.path.abspath(__file__))
+      PROFIL = {"auto": "auto", "fuss": "pedestrian", "rad": "bicycle"}
+      MINDEST = {"auto": 300, "fuss": 150, "rad": 200}
+
+      _lokal = threading.local()
+
+
+      def db():
+          c = getattr(_lokal, "c", None)
+          if c is None:
+              c = sqlite3.connect(DB, timeout=30)
+              c.row_factory = sqlite3.Row
+              c.execute("PRAGMA journal_mode=WAL")
+              _lokal.c = c
+          return c
+
+
+      def einrichten():
+          os.makedirs(os.path.dirname(DB), exist_ok=True)
+          db().executescript("""
+              CREATE TABLE IF NOT EXISTS strecken(
+                  id TEXT PRIMARY KEY, art TEXT, start REAL, ende REAL, distanz REAL, quelle TEXT,
+                  status TEXT, fehler TEXT, punkte TEXT, spur TEXT, fein TEXT, grob TEXT,
+                  dichte REAL, geaendert REAL);
+              CREATE INDEX IF NOT EXISTS i_start ON strecken(start);
+              CREATE INDEX IF NOT EXISTS i_status ON strecken(status);
+              CREATE INDEX IF NOT EXISTS i_geaendert ON strecken(geaendert);
+          """)
+          # Abgleich, der beim letzten Beenden mitten drin war, neu anstoßen
+          db().execute("UPDATE strecken SET status='wartet' WHERE status='laeuft'")
+          db().commit()
+
+
+      # ---------------------------------------------------------------- Geometrie
+
+      def abstand(a, b):
+          """Meter zwischen zwei (lat, lon)."""
+          dlat = (b[0] - a[0]) * 111320
+          dlon = (b[1] - a[1]) * 111320 * math.cos(math.radians(a[0]))
+          return math.hypot(dlat, dlon)
+
+
+      def vereinfachen(p, tol):
+          """Douglas-Peucker in Metern, ohne Rekursion."""
+          if len(p) < 3:
+              return p
+          kx = math.cos(math.radians(p[0][0])) * 111320
+          xy = [(q[1] * kx, q[0] * 111320) for q in p]
+          behalten = [False] * len(p)
+          behalten[0] = behalten[-1] = True
+          stapel = [(0, len(p) - 1)]
+          tol2 = tol * tol
+          while stapel:
+              a, b = stapel.pop()
+              if b <= a + 1:
+                  continue
+              ax, ay = xy[a]
+              bx, by = xy[b]
+              dx, dy = bx - ax, by - ay
+              l2 = max(dx * dx + dy * dy, 1e-9)
+              best, bi = 0.0, a
+              for i in range(a + 1, b):
+                  px, py = xy[i]
+                  t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / l2))
+                  qx, qy = ax + t * dx - px, ay + t * dy - py
+                  d = qx * qx + qy * qy
+                  if d > best:
+                      best, bi = d, i
+              if best > tol2:
+                  behalten[bi] = True
+                  stapel += [(a, bi), (bi, b)]
+          return [q for q, k in zip(p, behalten) if k]
+
+
+      def kodieren(p, faktor=1e5):
+          out, plat, plon = [], 0, 0
+          for lat, lon in p:
+              la, lo = int(round(lat * faktor)), int(round(lon * faktor))
+              for v in (la - plat, lo - plon):
+                  v = ~(v << 1) if v < 0 else v << 1
+                  while v >= 0x20:
+                      out.append(chr((0x20 | (v & 0x1F)) + 63))
+                      v >>= 5
+                  out.append(chr(v + 63))
+              plat, plon = la, lo
+          return "".join(out)
+
+
+      def dekodieren(s, faktor=1e6):
+          i, lat, lon, out = 0, 0, 0, []
+          while i < len(s):
+              werte = []
+              for _ in range(2):
+                  r = sh = 0
+                  while True:
+                      b = ord(s[i]) - 63
+                      i += 1
+                      r |= (b & 0x1F) << sh
+                      sh += 5
+                      if b < 0x20:
+                          break
+                  werte.append(~(r >> 1) if r & 1 else r >> 1)
+              lat += werte[0]
+              lon += werte[1]
+              out.append((lat / faktor, lon / faktor))
+          return out
+
+
+      def mittlerer_abstand(p):
+          if len(p) < 2:
+              return 0
+          return sum(abstand(p[i - 1], p[i]) for i in range(1, len(p))) / (len(p) - 1)
+
+
+      # ---------------------------------------------------------------- Valhalla
+
+      def valhalla(pfad, daten, timeout=120):
+          req = urllib.request.Request(VALHALLA + pfad, data=json.dumps(daten).encode(),
+                                       headers={"Content-Type": "application/json"})
+          try:
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+                  antwort = json.loads(r.read())
+          except urllib.error.HTTPError as e:
+              try:
+                  fehler = json.loads(e.read()).get("error")
+              except Exception:  # noqa: BLE001
+                  fehler = None
+              raise RuntimeError(fehler or f"Valhalla meldet {e.code}") from None
+          linie = []
+          for leg in antwort.get("trip", {}).get("legs", []):
+              linie += dekodieren(leg.get("shape", ""))
+          if not linie:
+              raise RuntimeError("Keine Linie erhalten")
+          return linie
+
+
+      def ausduennen(punkte, mindest):
+          """punkte: [[lat, lon, zeit], …]"""
+          if not punkte:
+              return []
+          out = [punkte[0]]
+          for p in punkte[1:]:
+              if abstand(out[-1], p) >= mindest:
+                  out.append(p)
+          if out[-1] is not punkte[-1]:
+              out.append(punkte[-1])
+          return out
+
+
+      def abgleichen(punkte, art):
+          duenn = ausduennen(punkte, 15 if art == "auto" else 6)
+          if len(duenn) < 2:
+              raise RuntimeError("Zu wenige GPS-Punkte")
+          luecke = mittlerer_abstand(duenn)
+          sparsam = luecke > 150
+          ergebnis, fehlgeschlagen, stuecke, start = [], 0, 0, 0
+          while start < len(duenn) - 1:
+              ende = min(start + 2000, len(duenn))
+              teil = duenn[start:ende]
+              stuecke += 1
+              try:
+                  linie = valhalla("/trace_route", {
+                      "shape": [{"lat": p[0], "lon": p[1], "time": int(p[2])} for p in teil],
+                      "costing": PROFIL.get(art, "auto"), "shape_match": "map_snap",
+                      "use_timestamps": not sparsam, "directions_type": "none",
+                      "trace_options": {"search_radius": 60 if sparsam else (40 if art == "auto" else 25),
+                                        "gps_accuracy": 30 if sparsam else 10,
+                                        "breakage_distance": 10000 if sparsam else 3000,
+                                        "interpolation_distance": 10}})
+              except RuntimeError:
+                  linie = None
+                  if sparsam:
+                      try:
+                          linie = routen(teil, art)
+                      except RuntimeError:
+                          linie = None
+                  if linie is None:
+                      fehlgeschlagen += 1
+                      linie = [(p[0], p[1]) for p in teil]
+              if ergebnis and linie:
+                  linie = linie[1:]
+              ergebnis += linie
+              start = ende - 1
+          if fehlgeschlagen == stuecke:
+              raise RuntimeError("Keine Straße gefunden")
+          return ergebnis, luecke
+
+
+      def routen(teil, art):
+          """Weg zwischen lückenhaften Punkten über /route (max. 20 Punkte pro Anfrage)."""
+          linie, start = [], 0
+          while start < len(teil) - 1:
+              ende = min(start + 20, len(teil))
+              stueck = teil[start:ende]
+              orte = [{"lat": p[0], "lon": p[1], "radius": 50,
+                       "type": "break" if i in (0, len(stueck) - 1) else "through"} for i, p in enumerate(stueck)]
+              l = valhalla("/route", {"locations": orte, "costing": PROFIL.get(art, "auto"), "directions_type": "none"}, 60)
+              if linie and l:
+                  l = l[1:]
+              linie += l
+              start = ende - 1
+          return linie
+
+
+      def speichere_spur(sid, spur, dichte=None):
+          fein = kodieren(vereinfachen(spur, 4))
+          grob = kodieren(vereinfachen(spur, 35))
+          db().execute("UPDATE strecken SET status='fertig', fehler=NULL, spur=?, fein=?, grob=?, dichte=COALESCE(?, dichte), geaendert=? WHERE id=?",
+                       (kodieren(spur, 1e6), fein, grob, dichte, time.time(), sid))
+          db().commit()
+
+
+      _stand = {"laeuft": False, "fertig_seit_start": 0, "fehler": None}
+
+
+      def arbeiter():
+          """Legt wartende Strecken nacheinander auf die Straße – neueste zuerst."""
+          while True:
+              try:
+                  z = db().execute("SELECT id, art, punkte FROM strecken WHERE status='wartet' ORDER BY start DESC LIMIT 1").fetchone()
+                  if not z:
+                      _stand["laeuft"] = False
+                      time.sleep(10)
+                      continue
+                  _stand["laeuft"] = True
+                  db().execute("UPDATE strecken SET status='laeuft' WHERE id=?", (z["id"],))
+                  db().commit()
+                  punkte = json.loads(z["punkte"] or "[]")
+                  try:
+                      spur, dichte = abgleichen(punkte, z["art"])
+                      speichere_spur(z["id"], spur, dichte)
+                      _stand["fertig_seit_start"] += 1
+                      _stand["fehler"] = None
+                  except urllib.error.URLError as e:
+                      # Valhalla nicht erreichbar: zurückstellen und später erneut versuchen
+                      db().execute("UPDATE strecken SET status='wartet' WHERE id=?", (z["id"],))
+                      db().commit()
+                      _stand["fehler"] = f"Valhalla nicht erreichbar ({e.reason})"
+                      time.sleep(30)
+                  except Exception as e:  # noqa: BLE001
+                      db().execute("UPDATE strecken SET status='fehler', fehler=?, geaendert=? WHERE id=?",
+                                   (str(e)[:300], time.time(), z["id"]))
+                      db().commit()
+              except Exception as e:  # noqa: BLE001
+                  _stand["fehler"] = str(e)
+                  time.sleep(5)
+
+
+      # ---------------------------------------------------------------- Daten für App und Browser
+
+      def hochladen(liste):
+          n = 0
+          for s in liste:
+              sid = str(s.get("id", ""))
+              art = s.get("art") if s.get("art") in PROFIL else "auto"
+              if not sid:
+                  continue
+              punkte = [[float(p[0]), float(p[1]), float(p[2]) if len(p) > 2 else 0.0] for p in s.get("punkte", [])]
+              dichte = mittlerer_abstand(punkte) if punkte else None
+              alt = db().execute("SELECT status FROM strecken WHERE id=?", (sid,)).fetchone()
+              db().execute("""INSERT INTO strecken(id, art, start, ende, distanz, quelle, status, punkte, dichte, geaendert)
+                              VALUES(?,?,?,?,?,?,?,?,?,?)
+                              ON CONFLICT(id) DO UPDATE SET art=excluded.art, start=excluded.start, ende=excluded.ende,
+                              distanz=excluded.distanz, quelle=excluded.quelle, punkte=excluded.punkte, dichte=excluded.dichte""",
+                           (sid, art, float(s.get("start", 0)), float(s.get("ende", s.get("start", 0))),
+                            float(s.get("distanz", 0)), s.get("quelle", "app"), "wartet", json.dumps(punkte), dichte, time.time()))
+              if s.get("spur"):
+                  # Schon auf dem iPhone abgeglichen – nicht noch einmal rechnen
+                  speichere_spur(sid, [(float(p[0]), float(p[1])) for p in s["spur"]])
+              elif s.get("neu_abgleichen") or not alt or alt["status"] in ("fehler",):
+                  db().execute("UPDATE strecken SET status='wartet' WHERE id=?", (sid,))
+              n += 1
+          db().commit()
+          return n
+
+
+      def zeile_meta(z):
+          return {"id": z["id"], "art": z["art"], "start": z["start"], "ende": z["ende"], "distanz": z["distanz"],
+                  "quelle": z["quelle"], "status": z["status"],
+                  "geschaetzt": bool(z["dichte"] and z["dichte"] > 150)}
+
+
+      def bereich(q):
+          von = float(q.get("von", ["0"])[0] or 0)
+          bis = float(q.get("bis", ["1e12"])[0] or 1e12)
+          arten = [a for a in q.get("art", [""])[0].split(",") if a in PROFIL]
+          sql, args = "start >= ? AND start < ?", [von, bis]
+          if arten:
+              sql += " AND art IN (%s)" % ",".join("?" * len(arten))
+              args += arten
+          return sql, args
+
+
+      def status():
+          zahlen = {r["status"]: r["n"] for r in db().execute("SELECT status, COUNT(*) n FROM strecken GROUP BY status")}
+          return {"zahlen": zahlen, "gesamt": sum(zahlen.values()), "laeuft": _stand["laeuft"],
+                  "fehler": _stand["fehler"], "valhalla": VALHALLA}
+
+
+      # ---------------------------------------------------------------- HTTP
+
+      class Handler(BaseHTTPRequestHandler):
+          server_version = "Spurwerk/1.0"
+
+          def log_message(self, *a):
+              pass
+
+          def _send(self, code, payload, ctype="application/json; charset=utf-8"):
+              body = payload if isinstance(payload, bytes) else json.dumps(payload, separators=(",", ":")).encode()
+              self.send_response(code)
+              self.send_header("Content-Type", ctype)
+              self.send_header("Content-Length", str(len(body)))
+              self.send_header("Cache-Control", "no-store")
+              self.end_headers()
+              self.wfile.write(body)
+
+          def _erlaubt(self):
+              if not TOKEN:
+                  return True
+              q = parse_qs(urlparse(self.path).query)
+              return self.headers.get("X-Token") == TOKEN or q.get("token", [""])[0] == TOKEN
+
+          def do_GET(self):
+              url = urlparse(self.path)
+              q = parse_qs(url.query)
+              try:
+                  if url.path in ("/", "/index.html"):
+                      with open(os.path.join(HERE, "index.html"), "rb") as f:
+                          return self._send(200, f.read(), "text/html; charset=utf-8")
+                  if not self._erlaubt():
+                      return self._send(401, {"error": "Token fehlt"})
+                  if url.path == "/api/status":
+                      return self._send(200, status())
+                  if url.path == "/api/strecken":
+                      sql, args = bereich(q)
+                      grenze = min(int(q.get("limit", ["200"])[0]), 2000)
+                      versatz = int(q.get("offset", ["0"])[0])
+                      zeilen = db().execute(f"SELECT id, art, start, ende, distanz, quelle, status, dichte FROM strecken WHERE {sql} ORDER BY start DESC LIMIT ? OFFSET ?",
+                                            args + [grenze, versatz]).fetchall()
+                      return self._send(200, {"strecken": [zeile_meta(z) for z in zeilen]})
+                  if url.path == "/api/summen":
+                      sql, args = bereich(q)
+                      out = {}
+                      for z in db().execute(f"SELECT art, COUNT(*) n, SUM(distanz) d, SUM(ende-start) t FROM strecken WHERE {sql} GROUP BY art", args):
+                          out[z["art"]] = {"anzahl": z["n"], "meter": z["d"] or 0, "sekunden": z["t"] or 0}
+                      return self._send(200, out)
+                  if url.path == "/api/linien":
+                      sql, args = bereich(q)
+                      spalte = "grob" if q.get("grob", ["0"])[0] == "1" else "fein"
+                      linien = []
+                      for z in db().execute(f"SELECT id, art, status, dichte, {spalte} g, punkte FROM strecken WHERE {sql}", args):
+                          if z["g"]:
+                              linien.append({"id": z["id"], "a": z["art"], "s": z["g"], "f": 1,
+                                             "x": 1 if (z["dichte"] or 0) > 150 else 0})
+                          else:  # noch nicht abgeglichen: rohe Punkte (gestrichelt)
+                              p = [(x[0], x[1]) for x in json.loads(z["punkte"] or "[]")]
+                              if len(p) > 1:
+                                  linien.append({"id": z["id"], "a": z["art"], "s": kodieren(vereinfachen(p, 35 if spalte == "grob" else 8)), "f": 0, "x": 0})
+                      return self._send(200, {"linien": linien})
+                  if url.path == "/api/abholen":
+                      seit = float(q.get("seit", ["0"])[0] or 0)
+                      zeilen = db().execute("SELECT id, status, fehler, spur, geaendert FROM strecken WHERE geaendert > ? AND status IN ('fertig','fehler') ORDER BY geaendert LIMIT 500",
+                                            (seit,)).fetchall()
+                      return self._send(200, {"strecken": [{"id": z["id"], "status": z["status"], "fehler": z["fehler"],
+                                                            "spur": z["spur"], "geaendert": z["geaendert"]} for z in zeilen]})
+                  if url.path == "/api/bekannt":
+                      return self._send(200, {"ids": [z[0] for z in db().execute("SELECT id FROM strecken")]})
+                  return self._send(404, {"error": "Unbekannt"})
+              except Exception as e:  # noqa: BLE001
+                  return self._send(500, {"error": str(e)})
+
+          def do_POST(self):
+              url = urlparse(self.path)
+              try:
+                  if not self._erlaubt():
+                      return self._send(401, {"error": "Token fehlt"})
+                  laenge = int(self.headers.get("Content-Length", "0"))
+                  daten = json.loads(self.rfile.read(laenge) or b"{}")
+                  if url.path == "/api/hochladen":
+                      return self._send(200, {"ok": True, "anzahl": hochladen(daten.get("strecken", []))})
+                  if url.path == "/api/neu_abgleichen":
+                      ids = [str(x) for x in daten.get("ids", [])]
+                      db().executemany("UPDATE strecken SET status='wartet' WHERE id=?", [(i,) for i in ids])
+                      db().commit()
+                      return self._send(200, {"ok": True})
+                  if url.path == "/api/loeschen":
+                      ids = [str(x) for x in daten.get("ids", [])]
+                      db().executemany("DELETE FROM strecken WHERE id=?", [(i,) for i in ids])
+                      db().commit()
+                      return self._send(200, {"ok": True})
+                  return self._send(404, {"error": "Unbekannt"})
+              except Exception as e:  # noqa: BLE001
+                  return self._send(500, {"error": str(e)})
+
+
+      if __name__ == "__main__":
+          einrichten()
+          threading.Thread(target=arbeiter, daemon=True).start()
+          print(f"Spurwerk-Server auf Port {PORT}, Valhalla {VALHALLA}", flush=True)
+          ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+
+  seite:
+    content: |
+      <!DOCTYPE html>
+      <html lang="de">
+      <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+      <title>Spurwerk</title>
+      <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+      <style>
+      :root{--bg:#1b1d22;--panel:#26282d;--panel2:#2f3238;--ink:#f1efe8;--mute:#b4b2a9;--dim:#888780;--line:#3a3d44;
+      --auto:#1D9E75;--autoH:#5DCAA5;--fuss:#7F77DD;--fussH:#AFA9EC;--rad:#D85A30;--radH:#F0997B}
+      *{box-sizing:border-box}
+      html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+      button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+      header{display:flex;align-items:center;gap:12px;padding:10px 16px;padding-top:max(10px,env(safe-area-inset-top));background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+      .logo{display:flex;align-items:center;gap:8px;font-weight:700;font-size:17px}
+      .logo i{width:26px;height:26px;border-radius:8px;background:var(--auto);display:inline-block;position:relative}
+      .logo i::after{content:"";position:absolute;left:6px;top:6px;width:14px;height:14px;border:3px solid #fff;border-width:0 0 3px 3px;transform:skewX(-20deg)}
+      .reiter{display:flex;background:var(--bg);border-radius:999px;padding:3px}
+      .reiter button{padding:6px 16px;border-radius:999px;color:var(--mute)}
+      .reiter button.an{background:var(--ink);color:#111}
+      .zeit{display:flex;align-items:center;gap:6px;margin-left:auto;flex-wrap:wrap}
+      .chips{display:flex;background:var(--bg);border-radius:999px;padding:3px}
+      .chips button{padding:5px 11px;border-radius:999px;color:var(--mute);font-size:13px}
+      .chips button.an{background:#E1F5EE;color:#085041}
+      .pfeil{width:34px;height:34px;border-radius:50%;background:var(--panel2);font-size:18px}
+      .pfeil:disabled{opacity:.35;cursor:default}
+      #zeitText{min-width:170px;text-align:center;font-weight:600}
+      main{position:absolute;top:var(--kopf,58px);left:0;right:0;bottom:0}
+      #karte{position:absolute;inset:0;background:var(--bg)}
+      .schwebe{position:absolute;z-index:500;background:rgba(38,40,45,.94);backdrop-filter:blur(8px);border-radius:18px;padding:10px 12px}
+      #artFilter{top:12px;left:12px;display:flex;gap:2px;padding:4px;border-radius:999px}
+      #artFilter button{padding:6px 12px;border-radius:999px;font-size:13px}
+      #artFilter button[data-art=""]{color:var(--ink)}#artFilter button[data-art=auto]{color:var(--autoH)}#artFilter button[data-art=fuss]{color:var(--fussH)}#artFilter button[data-art=rad]{color:var(--radH)}
+      #artFilter button.an{background:var(--ink);color:#111}
+      #summe{bottom:16px;left:12px;min-width:250px}
+      .kacheln{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px}
+      .kachel{border-radius:12px;padding:8px 10px}
+      .kachel small{display:block;font-size:12px}
+      .kachel b{font-size:19px}
+      .k-auto{background:#213a31}.k-auto small{color:var(--autoH)}
+      .k-fuss{background:#2d2b45}.k-fuss small{color:var(--fussH)}
+      .k-rad{background:#3d2720}.k-rad small{color:var(--radH)}
+      #stand{font-size:12px;color:var(--dim);margin-top:8px}
+      #liste{position:absolute;inset:0;overflow:auto;padding:16px;display:none}
+      .listeInnen{max-width:820px;margin:0 auto}
+      .tag{color:var(--mute);font-size:13px;margin:18px 4px 6px;display:flex;justify-content:space-between}
+      .zeile{display:flex;align-items:center;gap:12px;padding:10px 12px;background:var(--panel);border-radius:12px;margin-bottom:6px;cursor:pointer}
+      .zeile:hover{background:var(--panel2)}
+      .punkt{width:10px;height:10px;border-radius:50%;flex:none}
+      .zeile .t{flex:1;min-width:0}
+      .zeile .t small{color:var(--dim);display:block}
+      .marke{font-size:11px;padding:2px 8px;border-radius:999px;background:var(--panel2);color:var(--mute);white-space:nowrap}
+      .marke.w{color:#FAC775}.marke.f{color:#F09595}
+      .mehr{display:block;margin:14px auto;padding:10px 18px;border-radius:999px;background:var(--panel2)}
+      .leer{color:var(--dim);text-align:center;padding:40px 10px}
+      .leaflet-container{background:var(--bg);font:inherit}
+      .leaflet-control-attribution{background:rgba(0,0,0,.5)!important;color:#999!important}.leaflet-control-attribution a{color:#bbb!important}
+      @media(max-width:700px){#zeitText{min-width:0;flex:1}.zeit{margin-left:0;width:100%}#summe{left:8px;right:8px;bottom:8px}}
+      </style>
+      </head>
+      <body>
+      <header id="kopf">
+        <div class="logo"><i></i>Spurwerk</div>
+        <div class="reiter"><button data-ansicht="karte" class="an">Karte</button><button data-ansicht="strecken">Strecken</button></div>
+        <div class="zeit">
+          <div class="chips" id="spanne">
+            <button data-spanne="tag" class="an">Tag</button><button data-spanne="woche">Woche</button><button data-spanne="monat">Monat</button><button data-spanne="jahr">Jahr</button><button data-spanne="alles">Alles</button>
+          </div>
+          <button class="pfeil" id="zurueck" aria-label="Zurück">‹</button>
+          <div id="zeitText">Heute</div>
+          <button class="pfeil" id="vor" aria-label="Weiter">›</button>
+        </div>
+      </header>
+      <main>
+        <div id="karte"></div>
+        <div class="schwebe" id="artFilter">
+          <button data-art="" class="an">Alle</button><button data-art="auto">Auto</button><button data-art="fuss">Fuß</button><button data-art="rad">Rad</button>
+        </div>
+        <div class="schwebe" id="summe"><div class="kacheln" id="kacheln"></div><div id="stand"></div></div>
+        <div id="liste"><div class="listeInnen" id="listeInnen"></div></div>
+      </main>
+      <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+      <script>
+      {
+      const $$ = (id) => document.getElementById(id);
+      const FARBE = { auto: ["#1D9E75", "#5DCAA5"], fuss: ["#7F77DD", "#AFA9EC"], rad: ["#D85A30", "#F0997B"] };
+      const NAME = { auto: "Auto", fuss: "Zu Fuß", rad: "Fahrrad" };
+      const TOKEN = new URLSearchParams(location.search).get("token") || localStorage.getItem("sw-token") || "";
+      if (TOKEN) localStorage.setItem("sw-token", TOKEN);
+      const merk = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch (e) { return d; } };
+      const sichere = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} };
+
+      let ansicht = merk("sw-ansicht", "karte"), spanne = merk("sw-spanne", "tag"), art = merk("sw-art", ""), versatz = 0;
+      let gewaehlt = null, listeOffset = 0;
+
+      async function api(pfad) {
+        const r = await fetch(pfad + (pfad.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(TOKEN));
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+        return r.json();
+      }
+      const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+      const km = (m) => m < 1000 ? Math.round(m) + " m" : (m / 1000).toLocaleString("de-DE", { maximumFractionDigits: m < 100000 ? 1 : 0 }) + " km";
+      const dauer = (s) => { const m = Math.round(s / 60); return m < 60 ? m + " min" : Math.floor(m / 60) + " h " + String(m % 60).padStart(2, "0") + " min"; };
+      const uhr = (t) => new Date(t * 1000).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
+
+      // ------------------------------------------------ Zeitraum
+      function zeitraum() {
+        const h = new Date(); h.setHours(0, 0, 0, 0);
+        let von, bis, text;
+        if (spanne === "tag") {
+          von = new Date(h); von.setDate(von.getDate() + versatz); bis = new Date(von); bis.setDate(bis.getDate() + 1);
+          text = versatz === 0 ? "Heute" : versatz === -1 ? "Gestern" : von.toLocaleDateString("de-DE", { weekday: "long", day: "numeric", month: "long", year: von.getFullYear() !== h.getFullYear() ? "numeric" : undefined });
+        } else if (spanne === "woche") {
+          von = new Date(h); von.setDate(von.getDate() - ((von.getDay() + 6) % 7) + versatz * 7); bis = new Date(von); bis.setDate(bis.getDate() + 7);
+          const e = new Date(bis); e.setDate(e.getDate() - 1);
+          text = versatz === 0 ? "Diese Woche" : `$${von.toLocaleDateString("de-DE", { day: "numeric", month: "short" })} – $${e.toLocaleDateString("de-DE", { day: "numeric", month: "short", year: "numeric" })}`;
+        } else if (spanne === "monat") {
+          von = new Date(h.getFullYear(), h.getMonth() + versatz, 1); bis = new Date(von.getFullYear(), von.getMonth() + 1, 1);
+          text = von.toLocaleDateString("de-DE", { month: "long", year: "numeric" });
+        } else if (spanne === "jahr") {
+          von = new Date(h.getFullYear() + versatz, 0, 1); bis = new Date(von.getFullYear() + 1, 0, 1);
+          text = String(von.getFullYear());
+        } else { von = new Date(0); bis = new Date(4102444800000); text = "Alle Strecken"; }
+        return { von: von.getTime() / 1000, bis: bis.getTime() / 1000, text };
+      }
+      const abfrage = () => { const z = zeitraum(); return `von=$${z.von}&bis=$${z.bis}&art=$${art}`; };
+
+      // ------------------------------------------------ Karte
+      const karte = L.map("karte", { preferCanvas: true, zoomControl: false }).setView([52.43, 13.48], 12);
+      L.control.zoom({ position: "topright" }).addTo(karte);
+      L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+        maxZoom: 19, subdomains: "abcd", attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> · © <a href="https://carto.com/">CARTO</a>'
+      }).addTo(karte);
+      const renderer = L.canvas({ padding: 0.3 });
+      let schicht = L.layerGroup().addTo(karte), linien = [], ladeNr = 0;
+
+      function dekodiere(s) {
+        let i = 0, lat = 0, lon = 0; const out = [];
+        while (i < s.length) {
+          for (const k of [0, 1]) {
+            let r = 0, sh = 0, b;
+            do { b = s.charCodeAt(i++) - 63; r |= (b & 31) << sh; sh += 5; } while (b >= 32);
+            const v = r & 1 ? ~(r >> 1) : r >> 1;
+            if (k === 0) lat += v; else lon += v;
+          }
+          out.push([lat / 1e5, lon / 1e5]);
+        }
+        return out;
+      }
+
+      async function ladeKarte(zoomen) {
+        const nr = ++ladeNr, grob = spanne === "jahr" || spanne === "alles";
+        let d;
+        try { d = await api(`/api/linien?$${abfrage()}&grob=$${grob ? 1 : 0}`); } catch (e) { $$("stand").textContent = e.message; return; }
+        if (nr !== ladeNr) return;
+        schicht.clearLayers(); linien = [];
+        const grenzen = L.latLngBounds([]);
+        for (const l of d.linien) {
+          const p = dekodiere(l.s); if (p.length < 2) continue;
+          const [f, h] = FARBE[l.a] || FARBE.auto, sel = gewaehlt === l.id;
+          const schein = L.polyline(p, { renderer, color: f, weight: sel ? 16 : 10, opacity: l.f ? (l.x ? 0.12 : 0.25) : 0.1, interactive: false });
+          const kern = L.polyline(p, { renderer, color: sel ? "#fff" : h, weight: sel ? 5 : (l.f ? 3 : 2), opacity: l.f ? (l.x ? 0.55 : 0.95) : 0.6, dashArray: l.f ? null : "5 6" });
+          kern.on("click", () => waehle(l.id));
+          schein.addTo(schicht); kern.addTo(schicht);
+          linien.push({ id: l.id, kern }); grenzen.extend(kern.getBounds());
+        }
+        if (zoomen && grenzen.isValid()) karte.fitBounds(grenzen, { padding: [40, 40], maxZoom: 15 });
+      }
+
+      function waehle(id) {
+        gewaehlt = gewaehlt === id ? null : id;
+        ladeKarte(false).then(() => {
+          const l = linien.find((x) => x.id === gewaehlt);
+          if (l) karte.fitBounds(l.kern.getBounds(), { padding: [60, 60], maxZoom: 16 });
+        });
+      }
+
+      // ------------------------------------------------ Summen
+      async function ladeSummen() {
+        try {
+          const d = await api(`/api/summen?$${abfrage()}`);
+          const arten = ["auto", "fuss", "rad"].filter((a) => d[a] || a !== "rad");
+          $$("kacheln").innerHTML = arten.map((a) => `<div class="kachel k-$${a}"><small>$${NAME[a]}$${d[a] ? " · " + d[a].anzahl : ""}</small><b>$${km(d[a]?.meter || 0)}</b></div>`).join("");
+        } catch (e) { $$("kacheln").innerHTML = `<div class="leer">$${esc(e.message)}</div>`; }
+      }
+      async function ladeStand() {
+        try {
+          const s = await api("/api/status"), z = s.zahlen, fertig = z.fertig || 0, offen = (z.wartet || 0) + (z.laeuft || 0);
+          $$("stand").textContent = s.gesamt ? (offen ? `Abgleich läuft: $${fertig.toLocaleString("de-DE")} von $${s.gesamt.toLocaleString("de-DE")} fertig` : `$${s.gesamt.toLocaleString("de-DE")} Strecken, alle abgeglichen`) + (z.fehler ? ` · $${z.fehler} ohne Straße` : "") + (s.fehler ? " · " + s.fehler : "")
+            : "Noch keine Strecken – die App lädt sie beim nächsten Öffnen hoch.";
+        } catch (e) { $$("stand").textContent = e.message; }
+      }
+
+      // ------------------------------------------------ Liste
+      async function ladeListe(neu) {
+        if (neu) { listeOffset = 0; $$("listeInnen").innerHTML = '<div class="leer">Lade …</div>'; }
+        let d;
+        try { d = await api(`/api/strecken?$${abfrage()}&limit=150&offset=$${listeOffset}`); } catch (e) { $$("listeInnen").innerHTML = `<div class="leer">$${esc(e.message)}</div>`; return; }
+        if (neu) $$("listeInnen").innerHTML = "";
+        $$("listeInnen").querySelector(".mehr")?.remove();
+        let letzterTag = $$("listeInnen").dataset.letzterTag || "";
+        if (neu) letzterTag = "";
+        const html = [];
+        for (const s of d.strecken) {
+          const t = new Date(s.start * 1000).toLocaleDateString("de-DE", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+          if (t !== letzterTag) { html.push(`<div class="tag"><span>$${t}</span></div>`); letzterTag = t; }
+          const marke = s.status === "fertig" ? (s.geschaetzt ? '<span class="marke">geschätzt</span>' : "") : s.status === "fehler" ? '<span class="marke f">ohne Straße</span>' : '<span class="marke w">wartet</span>';
+          html.push(`<div class="zeile" data-id="$${esc(s.id)}"><span class="punkt" style="background:$${(FARBE[s.art] || FARBE.auto)[1]}"></span><div class="t">$${uhr(s.start)} – $${uhr(s.ende)} · $${NAME[s.art] || s.art}<small>$${dauer(s.ende - s.start)}$${s.quelle === "google" ? " · aus Google-Zeitachse" : ""}</small></div>$${marke}<b>$${km(s.distanz)}</b></div>`);
+        }
+        $$("listeInnen").insertAdjacentHTML("beforeend", html.join("") || (neu ? '<div class="leer">Keine Strecken in diesem Zeitraum.</div>' : ""));
+        $$("listeInnen").dataset.letzterTag = letzterTag;
+        listeOffset += d.strecken.length;
+        if (d.strecken.length === 150) $$("listeInnen").insertAdjacentHTML("beforeend", '<button class="mehr">Mehr laden</button>');
+      }
+      $$("listeInnen").addEventListener("click", (ev) => {
+        if (ev.target.closest(".mehr")) return ladeListe(false);
+        const z = ev.target.closest(".zeile"); if (!z) return;
+        zeigeAnsicht("karte"); gewaehlt = null; waehle(z.dataset.id);
+      });
+
+      // ------------------------------------------------ Bedienung
+      function zeigeAnsicht(a) {
+        ansicht = a; sichere("sw-ansicht", a);
+        document.querySelectorAll("[data-ansicht]").forEach((b) => b.classList.toggle("an", b.dataset.ansicht === a));
+        const k = a === "karte";
+        $$("karte").style.display = $$("artFilter").style.display = $$("summe").style.display = k ? "" : "none";
+        $$("liste").style.display = k ? "none" : "block";
+        if (k) setTimeout(() => karte.invalidateSize(), 0);
+        else ladeListe(true);
+      }
+      function alles(zoomen = true) {
+        const z = zeitraum();
+        $$("zeitText").textContent = z.text;
+        $$("vor").disabled = versatz >= 0 || spanne === "alles";
+        $$("zurueck").disabled = spanne === "alles";
+        document.querySelectorAll("[data-spanne]").forEach((b) => b.classList.toggle("an", b.dataset.spanne === spanne));
+        document.querySelectorAll("[data-art]").forEach((b) => b.classList.toggle("an", b.dataset.art === art));
+        gewaehlt = null;
+        ladeKarte(zoomen); ladeSummen(); ladeStand();
+        if (ansicht === "strecken") ladeListe(true);
+      }
+      document.querySelectorAll("[data-ansicht]").forEach((b) => b.onclick = () => zeigeAnsicht(b.dataset.ansicht));
+      document.querySelectorAll("[data-spanne]").forEach((b) => b.onclick = () => { spanne = b.dataset.spanne; versatz = 0; sichere("sw-spanne", spanne); alles(); });
+      document.querySelectorAll("[data-art]").forEach((b) => b.onclick = () => { art = b.dataset.art; sichere("sw-art", art); alles(false); });
+      $$("zurueck").onclick = () => { versatz--; alles(); };
+      $$("vor").onclick = () => { if (versatz < 0) { versatz++; alles(); } };
+      document.addEventListener("keydown", (ev) => { if (ev.key === "ArrowLeft") $$("zurueck").click(); if (ev.key === "ArrowRight") $$("vor").click(); });
+      const kopfHoehe = () => document.documentElement.style.setProperty("--kopf", $$("kopf").offsetHeight + "px");
+      new ResizeObserver(kopfHoehe).observe($$("kopf"));
+      setInterval(() => { ladeStand(); }, 15000);
+      zeigeAnsicht(ansicht);
+      alles();
+      }
+      </script>
+      </body>
+      </html>
+
