@@ -134,6 +134,38 @@ enum GoogleImport {
         aktivitaeten.append(Aktivitaet(art: art, start: start, ende: ende, distanz: distanz, punkte: punkte))
     }
 
+    /// Besuchte Orte mit Namen („Zuhause“, „Arbeit“, gespeicherte Orte) – für die Namen der Halte.
+    static func besuche(_ daten: Data) -> [OrtBesuch] {
+        guard let json = try? JSONSerialization.jsonObject(with: daten) else { return [] }
+        var ergebnis: [OrtBesuch] = []
+
+        func merken(_ ort: (Double, Double)?, name: String?, typ: String?) {
+            guard let ort else { return }
+            var text = name?.trimmingCharacters(in: .whitespaces) ?? ""
+            if text.isEmpty, let typ = typ?.lowercased() {
+                if typ.contains("home") { text = "Zuhause" } else if typ.contains("work") { text = "Arbeit" }
+            }
+            guard !text.isEmpty else { return }
+            ergebnis.append(OrtBesuch(lat: ort.0, lon: ort.1, name: text))
+        }
+
+        func neuerBesuch(_ e: [String: Any]) {
+            guard let v = e["visit"] as? [String: Any], let top = v["topCandidate"] as? [String: Any] else { return }
+            merken(koordinate(top["placeLocation"]), name: top["name"] as? String, typ: top["semanticType"] as? String)
+        }
+
+        if let liste = json as? [[String: Any]] {
+            liste.forEach(neuerBesuch)
+        } else if let objekt = json as? [String: Any] {
+            (objekt["semanticSegments"] as? [[String: Any]])?.forEach(neuerBesuch)
+            for e in (objekt["timelineObjects"] as? [[String: Any]]) ?? [] {
+                guard let pv = e["placeVisit"] as? [String: Any], let ort = pv["location"] as? [String: Any] else { continue }
+                merken(e7(ort), name: ort["name"] as? String, typ: ort["semanticType"] as? String)
+            }
+        }
+        return ergebnis
+    }
+
     // MARK: - Speichern
 
     static func speichern(_ strecken: [Strecke], in context: ModelContext) -> Ergebnis {

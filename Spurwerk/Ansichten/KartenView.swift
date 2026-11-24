@@ -34,9 +34,9 @@ extension FahrtArt {
     }
 }
 
-/// Strecken einer Art, eines Zustands und eines Jahres – zusammengefasst zu EINER Kartenlinie.
-/// So bleibt die Karte auch mit Tausenden Strecken flüssig, und bei Änderungen wird nur ein Jahr neu gezeichnet.
-struct SpurGruppe {
+/// Strecken einer Art und eines Zustands in einem Kartenbereich – zusammengefasst zu EINER Kartenlinie.
+/// Kleine Bereiche sorgen dafür, dass MapKit beim Verschieben nur die Linien zeichnet, die wirklich zu sehen sind.
+struct SpurGruppe: @unchecked Sendable {
     let art: FahrtArt
     let abgeglichen: Bool
     let geschaetzt: Bool
@@ -44,27 +44,41 @@ struct SpurGruppe {
     let linien: [MKPolyline]
 }
 
-/// Liest die Strecken im Hintergrund und baut daraus Kartenlinien und Summen für den gewählten Zeitraum.
+/// Liest die Strecken im Hintergrund und baut daraus Kartenlinien, Halte und Summen für den gewählten Zeitraum.
 @MainActor
 final class SpurCache: ObservableObject {
     static let shared = SpurCache()
 
-    @Published private(set) var gruppen: [SpurGruppe] = []
+    /// Linien für die nahe Ansicht (genau)
+    @Published private(set) var gruppenFein: [SpurGruppe] = []
+    /// Linien für die weite Ansicht: grob vereinfacht und ohne doppelte Straßen
+    @Published private(set) var gruppenGrob: [SpurGruppe] = []
     /// Kilometer je Art im gewählten Zeitraum (ohne laufende Aufnahme)
     @Published private(set) var summen: [FahrtArt: Double] = [:]
     @Published private(set) var anzahl: [FahrtArt: Int] = [:]
     /// Ausschnitt, der alle Strecken des Zeitraums zeigt
     @Published private(set) var ausschnitt: MKMapRect?
     @Published private(set) var geladen = false
+    /// Zählt hoch, sobald die Linien für einen neuen Zeitraum fertig sind
+    @Published private(set) var fertigNr = 0
+    /// Halte und Parkplätze im Zeitraum (für die Karte, höchstens 1.500)
+    @Published private(set) var halte: [Halt] = []
+    /// Halt direkt nach einer Strecke (für die Liste)
+    @Published private(set) var halteNach: [UUID: Halt] = [:]
+    /// Das Auto steht noch hier (letzte Autofahrt, höchstens drei Tage her)
+    @Published private(set) var autoSteht: Halt?
 
-    private struct Eintrag {
+    struct Eintrag: @unchecked Sendable {
         let kennung: String
         let art: FahrtArt
         let abgeglichen: Bool
         let geschaetzt: Bool
         let start: Date
+        let ende: Date
         let distanz: Double
         let linie: MKPolyline
+        let grob: [CLLocationCoordinate2D]
+        let ziel: CLLocationCoordinate2D
     }
 
     private struct Roh: @unchecked Sendable {
@@ -74,16 +88,19 @@ final class SpurCache: ObservableObject {
         let abgeglichen: Bool
         let geschaetzt: Bool
         let start: Date
+        let ende: Date
         let distanz: Double
         let daten: Data
     }
 
     private var eintraege: [UUID: Eintrag] = [:]
+    private var alleHalte: [Halt] = []
     private var laeuft = false
     private var nochmal = false
     private var von = Date.distantPast
     private var bis = Date.distantFuture
     private var artFilter: FahrtArt?
+    private var bauNr = 0
 
     /// Zeitraum oder Art geändert – nur neu gruppieren, nichts neu laden.
     func filtern(von: Date, bis: Date, art: FahrtArt?) {
@@ -108,26 +125,30 @@ final class SpurCache: ObservableObject {
             for f in alle where f.status != .aufnahme {
                 gueltig.insert(f.id)
                 let abgeglichen = f.status == .fertig && f.spurDaten != nil
-                let kennung = "\(f.statusText)-\(f.artText)-\(f.geschaetzt)-\(Int(f.distanzMeter))"
+                let kennung = "\(f.statusText)-\(f.artText)-\(f.geschaetzt)-\(Int(f.distanzMeter))-\(Int(f.ende?.timeIntervalSince1970 ?? 0))"
                 if bekannt[f.id] == kennung { continue }
                 let daten = abgeglichen ? (f.spurDaten ?? Data()) : f.rohDaten
                 neu.append(Roh(id: f.id, kennung: kennung, art: f.art, abgeglichen: abgeglichen,
-                               geschaetzt: f.geschaetzt, start: f.start, distanz: f.distanzMeter, daten: daten))
+                               geschaetzt: f.geschaetzt, start: f.start, ende: f.ende ?? f.start,
+                               distanz: f.distanzMeter, daten: daten))
             }
             var fertig: [(UUID, Eintrag)] = []
             fertig.reserveCapacity(neu.count)
             for r in neu {
                 let punkte = r.abgeglichen ? Koordinaten.ausDaten(r.daten) : SpurCache.rohPunkte(r.daten)
-                guard punkte.count > 1 else { continue }
+                guard punkte.count > 1, let ziel = punkte.last else { continue }
                 let einfach = Vereinfachen.linie(punkte, toleranzMeter: 5)
                 let linie = MKPolyline(coordinates: einfach, count: einfach.count)
+                let grob = Vereinfachen.linie(einfach, toleranzMeter: 35)
                 fertig.append((r.id, Eintrag(kennung: r.kennung, art: r.art, abgeglichen: r.abgeglichen,
-                                             geschaetzt: r.geschaetzt, start: r.start, distanz: r.distanz, linie: linie)))
+                                             geschaetzt: r.geschaetzt, start: r.start, ende: r.ende,
+                                             distanz: r.distanz, linie: linie, grob: grob, ziel: ziel)))
             }
             let gueltigFest = gueltig
             await MainActor.run {
                 self.eintraege = self.eintraege.filter { gueltigFest.contains($0.key) }
                 for (id, e) in fertig { self.eintraege[id] = e }
+                self.haltePruefen()
                 self.geladen = true
                 self.gruppenBauen()
                 self.laeuft = false
@@ -139,33 +160,142 @@ final class SpurCache: ObservableObject {
         }
     }
 
+    /// Halte aus allen Strecken ableiten (unabhängig vom Zeitraum).
+    private func haltePruefen() {
+        let stuecke = eintraege
+            .map { Halt.Stueck(id: $0.key, art: $0.value.art, start: $0.value.start, ende: $0.value.ende,
+                               zielLat: $0.value.ziel.latitude, zielLon: $0.value.ziel.longitude) }
+            .sorted { $0.start < $1.start }
+        alleHalte = Halt.berechnen(stuecke)
+        var nach: [UUID: Halt] = [:]
+        for h in alleHalte { nach[h.nachFahrt] = h }
+        halteNach = nach
+        if let letzter = alleHalte.last(where: { $0.parken && $0.bis == nil }),
+           letzter.von > Date().addingTimeInterval(-3 * 86_400) {
+            autoSteht = letzter
+        } else {
+            autoSteht = nil
+        }
+    }
+
     private func gruppenBauen() {
-        let kalender = Calendar.current
+        bauNr += 1
+        let nr = bauNr
+        let von = von, bis = bis, artFilter = artFilter
+        let auswahl = eintraege.filter { $0.value.start >= von && $0.value.start < bis }
+
         var summen: [FahrtArt: Double] = [:]
         var anzahl: [FahrtArt: Int] = [:]
-        var teile: [String: (art: FahrtArt, abgeglichen: Bool, geschaetzt: Bool, ids: [UUID], linien: [MKPolyline])] = [:]
-        var rect = MKMapRect.null
-
-        for (id, e) in eintraege where e.start >= von && e.start < bis {
+        for e in auswahl.values {
             summen[e.art, default: 0] += e.distanz
             anzahl[e.art, default: 0] += 1
-            if let artFilter, e.art != artFilter { continue }
-            let jahr = kalender.component(.year, from: e.start)
-            let s = "\(e.art.rawValue)-\(e.abgeglichen)-\(e.geschaetzt)-\(jahr)"
+        }
+        self.summen = summen
+        self.anzahl = anzahl
+
+        // Halte im Zeitraum: Parken beim Auto, Halte bei Fuß/Rad
+        let jetzt = Date()
+        var sichtbar = alleHalte.filter { h in
+            h.von < bis && (h.bis ?? jetzt) > von &&
+            (artFilter == nil || (h.parken ? artFilter == .auto : artFilter != .auto))
+        }
+        if sichtbar.count > 1500 { sichtbar = Array(sichtbar.suffix(1500)) }
+        halte = sichtbar
+
+        let liste = auswahl.filter { artFilter == nil || $0.value.art == artFilter }.map { ($0.key, $0.value) }
+        Task.detached(priority: .userInitiated) {
+            let fein = SpurCache.feinBauen(liste)
+            let grob = SpurCache.grobBauen(liste)
+            var rect = MKMapRect.null
+            for (_, e) in liste { rect = rect.union(e.linie.boundingMapRect) }
+            let ergebnis = rect
+            await MainActor.run {
+                guard nr == self.bauNr else { return }   // inzwischen anderer Zeitraum gewählt
+                self.gruppenFein = fein
+                self.gruppenGrob = grob
+                self.ausschnitt = ergebnis.isNull ? nil : ergebnis
+                self.fertigNr &+= 1
+            }
+        }
+    }
+
+    /// Genaue Linien, aufgeteilt in Kacheln von etwa 15 × 17 km.
+    nonisolated static func feinBauen(_ liste: [(UUID, Eintrag)]) -> [SpurGruppe] {
+        var teile: [String: (art: FahrtArt, abgeglichen: Bool, geschaetzt: Bool, ids: [UUID], linien: [MKPolyline])] = [:]
+        for (id, e) in liste {
+            let r = e.linie.boundingMapRect
+            let mitte = MKMapPoint(x: r.midX, y: r.midY).coordinate
+            let kx = Int((mitte.longitude / 0.25).rounded(.down))
+            let ky = Int((mitte.latitude / 0.15).rounded(.down))
+            let s = "f-\(e.art.rawValue)-\(e.abgeglichen)-\(e.geschaetzt)-\(kx)-\(ky)"
             teile[s, default: (e.art, e.abgeglichen, e.geschaetzt, [], [])].ids.append(id)
             teile[s]!.linien.append(e.linie)
-            rect = rect.union(e.linie.boundingMapRect)
         }
-
-        gruppen = teile.map { schluessel, t in
+        return teile.map { schluessel, t in
             var hasher = Hasher()
             for id in t.ids.sorted(by: { $0.uuidString < $1.uuidString }) { hasher.combine(id) }
             return SpurGruppe(art: t.art, abgeglichen: t.abgeglichen, geschaetzt: t.geschaetzt,
                               schluessel: "\(schluessel)-\(t.ids.count)-\(hasher.finalize())", linien: t.linien)
         }
-        self.summen = summen
-        self.anzahl = anzahl
-        ausschnitt = rect.isNull ? nil : rect
+    }
+
+    /// Weite Ansicht: Wer 500-mal dieselbe Straße fährt, bekommt sie nur einmal gezeichnet.
+    /// Dafür wird die Karte in ein Raster von etwa 120 m geteilt; Abschnitte, deren Rasterfelder
+    /// schon von einer anderen Strecke derselben Art belegt sind, fallen weg.
+    nonisolated static func grobBauen(_ liste: [(UUID, Eintrag)]) -> [SpurGruppe] {
+        let gLat = 0.0011
+        let gLon = 0.0018
+        func rang(_ e: Eintrag) -> Int { e.abgeglichen ? (e.geschaetzt ? 1 : 0) : 2 }
+        let sortiert = liste.map(\.1).sorted { rang($0) < rang($1) }
+
+        var belegt: [FahrtArt: Set<Int64>] = [:]
+        var teile: [String: (art: FahrtArt, abgeglichen: Bool, geschaetzt: Bool, linien: [MKPolyline], punkte: Int)] = [:]
+
+        for e in sortiert {
+            let p = e.grob
+            guard p.count > 1 else { continue }
+            let schon = belegt[e.art] ?? []
+            var eigene: [Int64] = []
+            var lauf: [CLLocationCoordinate2D] = []
+            let s = "g-\(e.art.rawValue)-\(e.abgeglichen)-\(e.geschaetzt)"
+            if teile[s] == nil { teile[s] = (e.art, e.abgeglichen, e.geschaetzt, [], 0) }
+
+            func abschliessen() {
+                if lauf.count > 1 {
+                    teile[s]!.linien.append(MKPolyline(coordinates: lauf, count: lauf.count))
+                    teile[s]!.punkte += lauf.count
+                }
+                lauf.removeAll(keepingCapacity: true)
+            }
+
+            for i in 1..<p.count {
+                let a = p[i - 1], b = p[i]
+                let schritte = max(1, Int(max(abs(b.latitude - a.latitude) / gLat,
+                                              abs(b.longitude - a.longitude) / gLon).rounded(.up)))
+                var neu = false
+                for k in 0...schritte {
+                    let t = Double(k) / Double(schritte)
+                    let la = a.latitude + (b.latitude - a.latitude) * t
+                    let lo = a.longitude + (b.longitude - a.longitude) * t
+                    let feld = Int64((la / gLat).rounded(.down)) * 1_000_000 + Int64((lo / gLon).rounded(.down) + 500_000)
+                    eigene.append(feld)
+                    if !schon.contains(feld) { neu = true }
+                }
+                if neu {
+                    if lauf.isEmpty { lauf.append(a) }
+                    lauf.append(b)
+                } else {
+                    abschliessen()
+                }
+            }
+            abschliessen()
+            belegt[e.art, default: []].formUnion(eigene)
+        }
+        return teile.compactMap { schluessel, t in
+            guard !t.linien.isEmpty else { return nil }
+            return SpurGruppe(art: t.art, abgeglichen: t.abgeglichen, geschaetzt: t.geschaetzt,
+                              schluessel: "\(schluessel)-\(t.linien.count)-\(t.punkte)", linien: t.linien)
+        }
     }
 
     nonisolated static func rohPunkte(_ daten: Data) -> [CLLocationCoordinate2D] {
@@ -214,21 +344,30 @@ struct KartenView: View {
     @EnvironmentObject private var abgleich: Abgleich
     @ObservedObject private var cache = SpurCache.shared
     @ObservedObject private var zeit = ZeitFilter.shared
+    @ObservedObject private var namen = OrtNamen.shared
     @State private var filter: FahrtArt?
     @State private var zoomNr = 0
+    @State private var zoomWunsch = false
+    @State private var fokusNr = 0
+    @State private var fokus: CLLocationCoordinate2D?
 
     private func filtern(zoomen: Bool) {
         let b = zeit.bereich
+        // Gezoomt wird erst, wenn die Linien des neuen Zeitraums im Hintergrund fertig sind
+        if zoomen { zoomWunsch = true }
         cache.filtern(von: b.von, bis: b.bis, art: filter)
-        if zoomen { zoomNr += 1 }
     }
 
     var body: some View {
-        SpurKarte(gruppen: cache.gruppen,
+        SpurKarte(fein: cache.gruppenFein,
+                  grob: cache.gruppenGrob,
+                  halte: cache.halte,
                   live: recorder.livePunkte,
                   liveArt: recorder.art,
                   zoomNr: zoomNr,
-                  zoomRect: cache.ausschnitt)
+                  zoomRect: cache.ausschnitt,
+                  fokusNr: fokusNr,
+                  fokus: fokus)
             .ignoresSafeArea(edges: .top)
             .safeAreaInset(edge: .top) {
                 VStack(spacing: 8) {
@@ -238,9 +377,31 @@ struct KartenView: View {
                 .padding(.horizontal, 16)
             }
             .safeAreaInset(edge: .bottom) {
-                TagesKarte()
-                    .padding(.horizontal, 10)
-                    .padding(.bottom, 6)
+                VStack(alignment: .leading, spacing: 8) {
+                    if let steht = cache.autoSteht, !recorder.nimmtAuf {
+                        Button {
+                            fokus = steht.koordinate
+                            fokusNr += 1
+                        } label: {
+                            HStack(spacing: 8) {
+                                HaltSymbol(parken: true)
+                                Text("Auto steht seit \(steht.von.formatted(.dateTime.hour().minute().locale(Locale(identifier: "de_DE"))))"
+                                     + (namen.name(steht.lat, steht.lon).map { " · \($0)" } ?? ""))
+                                    .font(.footnote.weight(.medium))
+                                    .lineLimit(1)
+                            }
+                            .padding(.leading, 5).padding(.trailing, 12).padding(.vertical, 5)
+                            .background(Capsule().fill(Color(red: 0.08, green: 0.13, blue: 0.19).opacity(0.95)))
+                            .foregroundStyle(.white)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.leading, 6)
+                        .task(id: steht.id) { namen.anfragen(steht.lat, steht.lon) }
+                    }
+                    TagesKarte()
+                }
+                .padding(.horizontal, 10)
+                .padding(.bottom, 6)
             }
             .onAppear {
                 filtern(zoomen: false)
@@ -248,18 +409,69 @@ struct KartenView: View {
             }
             .onChange(of: zeit.schluessel) { _, _ in filtern(zoomen: true) }
             .onChange(of: filter) { _, _ in filtern(zoomen: false) }
+            .onChange(of: cache.fertigNr) { _, _ in
+                if zoomWunsch { zoomWunsch = false; zoomNr += 1 }
+            }
             .onChange(of: abgleich.version) { _, _ in cache.aktualisieren(container: recorder.container) }
             .onChange(of: recorder.nimmtAuf) { _, _ in cache.aktualisieren(container: recorder.container) }
     }
 }
 
+/// Wie eine Linie gezeichnet wird: weicher Schein und heller Kern in EINEM Durchgang.
+struct LinienStil {
+    var schein: UIColor?
+    var scheinBreite: CGFloat = 12
+    var kern: UIColor
+    var kernBreite: CGFloat
+    var gestrichelt = false
+
+    func zeichnen(_ pfad: CGPath, zoom: MKZoomScale, in ctx: CGContext) {
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+        if let schein {
+            ctx.addPath(pfad)
+            ctx.setStrokeColor(schein.cgColor)
+            ctx.setLineWidth(scheinBreite / zoom)
+            ctx.strokePath()
+        }
+        ctx.addPath(pfad)
+        ctx.setStrokeColor(kern.cgColor)
+        ctx.setLineWidth(kernBreite / zoom)
+        if gestrichelt { ctx.setLineDash(phase: 0, lengths: [5 / zoom, 6 / zoom]) }
+        ctx.strokePath()
+        ctx.setLineDash(phase: 0, lengths: [])
+    }
+}
+
+final class LeuchtMultiRenderer: MKMultiPolylineRenderer {
+    var stil = LinienStil(kern: .white, kernBreite: 3)
+    override func draw(_ mapRect: MKMapRect, zoomScale: MKZoomScale, in context: CGContext) {
+        if path == nil { createPath() }
+        guard let pfad = path else { return }
+        stil.zeichnen(pfad, zoom: zoomScale, in: context)
+    }
+}
+
+final class LeuchtRenderer: MKPolylineRenderer {
+    var stil = LinienStil(kern: .white, kernBreite: 3)
+    override func draw(_ mapRect: MKMapRect, zoomScale: MKZoomScale, in context: CGContext) {
+        if path == nil { createPath() }
+        guard let pfad = path else { return }
+        stil.zeichnen(pfad, zoom: zoomScale, in: context)
+    }
+}
+
 /// Die Karte selbst – direkt mit MapKit, damit Tausende Strecken als wenige Linien gezeichnet werden.
 struct SpurKarte: UIViewRepresentable {
-    let gruppen: [SpurGruppe]
+    let fein: [SpurGruppe]
+    let grob: [SpurGruppe]
+    var halte: [Halt] = []
     let live: [CLLocationCoordinate2D]
     let liveArt: FahrtArt
     var zoomNr: Int = 0
     var zoomRect: MKMapRect?
+    var fokusNr: Int = 0
+    var fokus: CLLocationCoordinate2D?
 
     func makeCoordinator() -> Koordinator { Koordinator() }
 
@@ -272,6 +484,7 @@ struct SpurKarte: UIViewRepresentable {
         karte.showsUserLocation = true
         karte.showsCompass = true
         karte.userTrackingMode = .follow
+        karte.register(MKMarkerAnnotationView.self, forAnnotationViewWithReuseIdentifier: MKMapViewDefaultClusterAnnotationViewReuseIdentifier)
         let knopf = MKUserTrackingButton(mapView: karte)
         knopf.translatesAutoresizingMaskIntoConstraints = false
         knopf.backgroundColor = UIColor.secondarySystemBackground.withAlphaComponent(0.85)
@@ -285,13 +498,29 @@ struct SpurKarte: UIViewRepresentable {
     }
 
     func updateUIView(_ karte: MKMapView, context: Context) {
-        context.coordinator.anwenden(karte, gruppen: gruppen, live: live, liveArt: liveArt)
-        context.coordinator.zoomen(karte, nr: zoomNr, rect: zoomRect)
+        let k = context.coordinator
+        k.fein = fein
+        k.grob = grob
+        k.linienAnwenden(karte)
+        k.liveAnwenden(karte, live: live, liveArt: liveArt)
+        k.halteAnwenden(karte, halte)
+        k.zoomen(karte, nr: zoomNr, rect: zoomRect)
+        k.fokussieren(karte, nr: fokusNr, ort: fokus)
     }
 
+    @MainActor
     final class Koordinator: NSObject, MKMapViewDelegate {
-        private struct Stil { let art: FahrtArt; let abgeglichen: Bool; let geschaetzt: Bool; let schein: Bool; let live: Bool }
+        var fein: [SpurGruppe] = []
+        var grob: [SpurGruppe] = []
+        /// Weite Ansicht (mehr als etwa 15 km sichtbar) → grobe Linien ohne Doppelungen
+        private var weit = false
+        private var aktuell: [String: MKOverlay] = [:]
+        private var stile: [ObjectIdentifier: LinienStil] = [:]
+        private var liveOverlay: MKOverlay?
+        private var liveAnzahl = 0
+        private var marken: [String: HaltMarke] = [:]
         private var letzterZoom = 0
+        private var letzterFokus = 0
 
         func zoomen(_ karte: MKMapView, nr: Int, rect: MKMapRect?) {
             guard nr != letzterZoom else { return }
@@ -304,70 +533,145 @@ struct SpurKarte: UIViewRepresentable {
             if r.size.height < mindest { r = r.insetBy(dx: 0, dy: -(mindest - r.size.height) / 2) }
             karte.setVisibleMapRect(r, edgePadding: UIEdgeInsets(top: 160, left: 40, bottom: 300, right: 40), animated: true)
         }
-        private var aktuell: [String: [MKOverlay]] = [:]
-        private var stile: [ObjectIdentifier: Stil] = [:]
-        private var liveOverlays: [MKOverlay] = []
-        private var liveAnzahl = 0
 
-        func anwenden(_ karte: MKMapView, gruppen: [SpurGruppe], live: [CLLocationCoordinate2D], liveArt: FahrtArt) {
+        func fokussieren(_ karte: MKMapView, nr: Int, ort: CLLocationCoordinate2D?) {
+            guard nr != letzterFokus, let ort else { return }
+            letzterFokus = nr
+            karte.userTrackingMode = .none
+            karte.setRegion(MKCoordinateRegion(center: ort, latitudinalMeters: 700, longitudinalMeters: 700), animated: true)
+            if let m = marken.values.first(where: { $0.halt.bis == nil && $0.halt.parken }) {
+                karte.selectAnnotation(m, animated: true)
+            }
+        }
+
+        func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
+            let neu = mapView.region.span.latitudeDelta > 0.14
+            guard neu != weit else { return }
+            weit = neu
+            linienAnwenden(mapView)
+        }
+
+        func linienAnwenden(_ karte: MKMapView) {
+            let gruppen = weit ? grob : fein
             let gewuenscht = Set(gruppen.map(\.schluessel))
-            for (schluessel, overlays) in aktuell where !gewuenscht.contains(schluessel) {
-                karte.removeOverlays(overlays)
-                overlays.forEach { stile[ObjectIdentifier($0)] = nil }
+            var weg: [MKOverlay] = []
+            for (schluessel, o) in aktuell where !gewuenscht.contains(schluessel) {
+                weg.append(o)
+                stile[ObjectIdentifier(o)] = nil
                 aktuell[schluessel] = nil
             }
+            if !weg.isEmpty { karte.removeOverlays(weg) }
+            // Gebrochene (geschätzte, rohe) Linien unten, fertige oben
+            var neu: [(Int, MKOverlay)] = []
             for g in gruppen where aktuell[g.schluessel] == nil {
-                let schein = MKMultiPolyline(g.linien)
-                let kern = MKMultiPolyline(g.linien)
-                stile[ObjectIdentifier(schein)] = Stil(art: g.art, abgeglichen: g.abgeglichen, geschaetzt: g.geschaetzt, schein: true, live: false)
-                stile[ObjectIdentifier(kern)] = Stil(art: g.art, abgeglichen: g.abgeglichen, geschaetzt: g.geschaetzt, schein: false, live: false)
-                // Erst alle Scheine, dann die Kerne darüber
-                karte.insertOverlay(schein, at: 0, level: .aboveRoads)
-                karte.addOverlay(kern, level: .aboveRoads)
-                aktuell[g.schluessel] = [schein, kern]
+                let o = MKMultiPolyline(g.linien)
+                let art = g.art
+                var stil = LinienStil(kern: art.uiHell, kernBreite: weit ? 2.5 : 3.5)
+                if g.abgeglichen {
+                    stil.schein = art.uiFarbe.withAlphaComponent(g.geschaetzt ? 0.12 : 0.28)
+                    stil.kern = art.uiHell.withAlphaComponent(g.geschaetzt ? 0.5 : 1)
+                } else {
+                    stil.schein = nil
+                    stil.kern = art.uiHell.withAlphaComponent(0.8)
+                    stil.kernBreite = 2.5
+                    stil.gestrichelt = true
+                }
+                if weit { stil.scheinBreite = 9 }
+                stile[ObjectIdentifier(o)] = stil
+                aktuell[g.schluessel] = o
+                neu.append((g.abgeglichen && !g.geschaetzt ? 1 : 0, o))
             }
+            for (_, o) in neu.sorted(by: { $0.0 < $1.0 }) {
+                if (o as? MKMultiPolyline).map({ stile[ObjectIdentifier($0)]?.schein == nil }) == true {
+                    karte.insertOverlay(o, at: 0, level: .aboveRoads)
+                } else {
+                    karte.addOverlay(o, level: .aboveRoads)
+                }
+            }
+        }
 
-            if live.count != liveAnzahl {
-                karte.removeOverlays(liveOverlays)
-                liveOverlays.forEach { stiles in stile[ObjectIdentifier(stiles)] = nil }
-                liveOverlays = []
-                liveAnzahl = live.count
-                if live.count > 1 {
-                    let schein = MKPolyline(coordinates: live, count: live.count)
-                    let kern = MKPolyline(coordinates: live, count: live.count)
-                    stile[ObjectIdentifier(schein)] = Stil(art: liveArt, abgeglichen: true, geschaetzt: false, schein: true, live: true)
-                    stile[ObjectIdentifier(kern)] = Stil(art: liveArt, abgeglichen: true, geschaetzt: false, schein: false, live: true)
-                    karte.addOverlays([schein, kern], level: .aboveLabels)
-                    liveOverlays = [schein, kern]
+        func liveAnwenden(_ karte: MKMapView, live: [CLLocationCoordinate2D], liveArt: FahrtArt) {
+            guard live.count != liveAnzahl else { return }
+            if let alt = liveOverlay {
+                karte.removeOverlay(alt)
+                stile[ObjectIdentifier(alt)] = nil
+            }
+            liveOverlay = nil
+            liveAnzahl = live.count
+            guard live.count > 1 else { return }
+            let o = MKPolyline(coordinates: live, count: live.count)
+            stile[ObjectIdentifier(o)] = LinienStil(schein: liveArt.uiFarbe.withAlphaComponent(0.35), scheinBreite: 16,
+                                                   kern: .white, kernBreite: 4)
+            karte.addOverlay(o, level: .aboveLabels)
+            liveOverlay = o
+        }
+
+        func halteAnwenden(_ karte: MKMapView, _ halte: [Halt]) {
+            let gewuenscht = Dictionary(halte.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+            let weg = marken.filter { gewuenscht[$0.key] == nil || gewuenscht[$0.key]!.bis != $0.value.halt.bis }
+            if !weg.isEmpty {
+                karte.removeAnnotations(Array(weg.values))
+                for k in weg.keys { marken[k] = nil }
+            }
+            var neu: [HaltMarke] = []
+            for (id, h) in gewuenscht where marken[id] == nil {
+                let m = HaltMarke(h, name: OrtNamen.shared.name(h.lat, h.lon))
+                marken[id] = m
+                neu.append(m)
+            }
+            if !neu.isEmpty { karte.addAnnotations(neu) }
+        }
+
+        func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
+            if let cluster = annotation as? MKClusterAnnotation {
+                let v = mapView.dequeueReusableAnnotationView(withIdentifier: MKMapViewDefaultClusterAnnotationViewReuseIdentifier,
+                                                              for: cluster) as? MKMarkerAnnotationView
+                v?.markerTintColor = UIColor(red: 0.11, green: 0.23, blue: 0.36, alpha: 1)
+                v?.glyphText = "\(cluster.memberAnnotations.count)"
+                v?.displayPriority = .defaultLow
+                return v
+            }
+            guard let marke = annotation as? HaltMarke else { return nil }
+            let kennung = marke.halt.parken ? "parken" : "halt"
+            let v = mapView.dequeueReusableAnnotationView(withIdentifier: kennung)
+                ?? MKAnnotationView(annotation: marke, reuseIdentifier: kennung)
+            v.annotation = marke
+            v.image = marke.halt.parken ? HaltMarke.bildParken : HaltMarke.bildHalt
+            v.canShowCallout = true
+            v.clusteringIdentifier = "halt"
+            v.collisionMode = .circle
+            v.displayPriority = marke.halt.bis == nil ? .required : (marke.halt.parken ? .defaultHigh : .defaultLow)
+            return v
+        }
+
+        func mapView(_ mapView: MKMapView, didSelect view: MKAnnotationView) {
+            guard let marke = view.annotation as? HaltMarke else { return }
+            let h = marke.halt
+            Task { @MainActor in
+                OrtNamen.shared.anfragen(h.lat, h.lon)
+                for _ in 0..<8 {
+                    if let n = OrtNamen.shared.name(h.lat, h.lon) {
+                        marke.title = "\(h.titel) · \(n)"
+                        return
+                    }
+                    try? await Task.sleep(for: .milliseconds(500))
                 }
             }
         }
 
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             guard let stil = stile[ObjectIdentifier(overlay)] else { return MKOverlayRenderer(overlay: overlay) }
-            let r: MKOverlayPathRenderer
             if let multi = overlay as? MKMultiPolyline {
-                r = MKMultiPolylineRenderer(multiPolyline: multi)
-            } else if let einzel = overlay as? MKPolyline {
-                r = MKPolylineRenderer(polyline: einzel)
-            } else {
-                return MKOverlayRenderer(overlay: overlay)
+                let r = LeuchtMultiRenderer(multiPolyline: multi)
+                r.stil = stil
+                return r
             }
-            r.lineCap = .round
-            r.lineJoin = .round
-            if stil.live {
-                r.strokeColor = stil.schein ? stil.art.uiFarbe.withAlphaComponent(0.35) : .white
-                r.lineWidth = stil.schein ? 16 : 4
-            } else if stil.schein {
-                r.strokeColor = stil.art.uiFarbe.withAlphaComponent(stil.abgeglichen ? (stil.geschaetzt ? 0.12 : 0.28) : 0.15)
-                r.lineWidth = 12
-            } else {
-                // geschätzte Google-Strecken blasser
-                r.strokeColor = stil.art.uiHell.withAlphaComponent(stil.geschaetzt ? 0.5 : 1)
-                r.lineWidth = stil.abgeglichen ? 3.5 : 2.5
-                if !stil.abgeglichen { r.lineDashPattern = [5, 6] }
+            if let einzel = overlay as? MKPolyline {
+                let r = LeuchtRenderer(polyline: einzel)
+                r.stil = stil
+                return r
             }
-            return r
+            return MKOverlayRenderer(overlay: overlay)
         }
     }
 }
@@ -443,7 +747,8 @@ struct TagesKarte: View {
         .padding(.horizontal, 16)
         .padding(.top, 10)
         .padding(.bottom, 16)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+        // kein Glas-Effekt: Unschärfe über der Karte kostet bei jeder Bewegung viel Rechenzeit
+        .background(Color(uiColor: .secondarySystemBackground).opacity(0.96), in: RoundedRectangle(cornerRadius: 28, style: .continuous))
     }
 }
 
@@ -509,7 +814,7 @@ struct ArtFilter: View {
             }
         }
         .padding(5)
-        .background(.ultraThinMaterial, in: Capsule())
+        .background(Color(uiColor: .secondarySystemBackground).opacity(0.94), in: Capsule())
     }
 
     private func knopf(_ art: FahrtArt?, text: String, symbol: String?) -> some View {

@@ -139,6 +139,6 @@ struct ZeitLeiste: View {
         .font(.body.weight(.semibold))
         .padding(.horizontal, 6)
         .padding(.vertical, 4)
-        .background(.ultraThinMaterial, in: Capsule())
+        .background(Color(uiColor: .secondarySystemBackground).opacity(0.94), in: Capsule())
     }
 }

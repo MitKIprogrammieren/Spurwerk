@@ -143,9 +143,11 @@ struct EinstellungenView: View {
                 do {
                     let daten = try Data(contentsOf: url)
                     // Einlesen kann bei großen Dateien dauern – nicht auf dem Hauptthread
-                    let strecken = try await Task.detached(priority: .userInitiated) {
-                        try GoogleImport.lesen(daten)
+                    let (strecken, orte) = try await Task.detached(priority: .userInitiated) {
+                        let strecken = try GoogleImport.lesen(daten)
+                        return (strecken, GoogleImport.besuche(daten))
                     }.value
+                    OrtNamen.shared.hinzufuegen(orte)
                     let ergebnis = GoogleImport.speichern(strecken, in: context)
                     neu += ergebnis.neu
                     doppelt += ergebnis.doppelt

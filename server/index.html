@@ -51,6 +51,12 @@ main{position:absolute;top:var(--kopf,58px);left:0;right:0;bottom:0}
 .zeile .t small{color:var(--dim);display:block}
 .marke{font-size:11px;padding:2px 8px;border-radius:999px;background:var(--panel2);color:var(--mute);white-space:nowrap}
 .marke.w{color:#FAC775}.marke.f{color:#F09595}
+.zeile.halt{background:transparent;border:1px dashed var(--panel2);padding:7px 12px}
+.zeile.halt .t{font-size:14px}
+.hp{width:20px;height:20px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;font:700 12px/1 system-ui;color:#fff;background:#1c3a5c;border:1.5px solid #85B7EB}
+.hp.h{width:12px;height:12px;margin:4px;background:#EF9F27;border:1.5px solid rgba(0,0,0,.5)}
+.maplibregl-popup-content{background:#1f2227;color:#e8e8ea;border-radius:10px;padding:8px 12px;font-size:13px}
+.maplibregl-popup-tip{border-top-color:#1f2227!important;border-bottom-color:#1f2227!important}
 .mehr{display:block;margin:14px auto;padding:10px 18px;border-radius:999px;background:var(--panel2)}
 .leer{color:var(--dim);text-align:center;padding:40px 10px}
 .maplibregl-ctrl-attrib{background:rgba(0,0,0,.55)!important;color:#aaa!important;font-size:11px}.maplibregl-ctrl-attrib a{color:#ccc!important}
@@ -106,7 +112,20 @@ async function api(pfad) {
 }
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const km = (m) => m < 1000 ? Math.round(m) + " m" : (m / 1000).toLocaleString("de-DE", { maximumFractionDigits: m < 100000 ? 1 : 0 }) + " km";
-const dauer = (s) => { const m = Math.round(s / 60); return m < 60 ? m + " min" : Math.floor(m / 60) + " h " + String(m % 60).padStart(2, "0") + " min"; };
+const dauer = (s) => { const m = Math.round(s / 60), h = Math.floor(m / 60); return m < 60 ? m + " min" : h >= 24 ? Math.floor(h / 24) + " Tg " + (h % 24) + " h" : h + " h " + String(m % 60).padStart(2, "0") + " min"; };
+async function post(pfad, inhalt) {
+  const r = await fetch(pfad + "?token=" + encodeURIComponent(TOKEN), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(inhalt) });
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+  return r.json();
+}
+const haltTitel = (h) => h.p ? (h.bis && h.bis - h.von < 900 ? "Kurzer Halt" : "Geparkt") : "Aufenthalt";
+function haltZeit(h) {
+  const tag = (t) => new Date(t * 1000).toLocaleDateString("de-DE", { weekday: "short", day: "2-digit", month: "2-digit" });
+  const jetzt = Date.now() / 1000;
+  if (!h.bis) return `seit ${tag(h.von) === tag(jetzt) ? "" : tag(h.von) + " "}${uhr(h.von)} · ${dauer(jetzt - h.von)}`;
+  const gleich = tag(h.von) === tag(h.bis);
+  return `${gleich ? "" : tag(h.von) + " "}${uhr(h.von)} – ${gleich ? "" : tag(h.bis) + " "}${uhr(h.bis)} · ${dauer(h.bis - h.von)}`;
+}
 const uhr = (t) => new Date(t * 1000).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
 
 // ------------------------------------------------ Zeitraum
@@ -198,6 +217,36 @@ function spurenEinrichten() {
     paint: { "line-color": FARB_AUSDRUCK(1), "line-width": 2, "line-opacity": 0.6, "line-dasharray": [2, 2.5] } });
   schicht({ id: "gewaehlt", type: "line", source: "spuren", filter: ["==", ["get", "id"], gewaehlt || ""],
     layout: { "line-cap": "round", "line-join": "round" }, paint: { "line-color": "#ffffff", "line-width": 5 } });
+  // Halte und Parkplätze
+  if (!karte.getSource("halte")) karte.addSource("halte", { type: "geojson", data: halteGeo });
+  const parken = ["==", ["get", "p"], 1];
+  schicht({ id: "halt-punkt", type: "circle", source: "halte", minzoom: 10, filter: ["!", parken],
+    paint: { "circle-radius": 5, "circle-color": "#EF9F27", "circle-stroke-width": 1.5, "circle-stroke-color": "rgba(0,0,0,.5)" } });
+  schicht({ id: "park-kreis", type: "circle", source: "halte", minzoom: 10, filter: parken,
+    paint: { "circle-radius": ["interpolate", ["linear"], ["zoom"], 10, 6, 14, 10], "circle-color": "#1c3a5c",
+             "circle-stroke-width": 1.5, "circle-stroke-color": "#85B7EB" } });
+  schicht({ id: "park-p", type: "symbol", source: "halte", minzoom: 12, filter: parken,
+    layout: { "text-field": "P", "text-font": ["Noto Sans Bold"], "text-size": 12, "text-allow-overlap": true, "text-ignore-placement": true },
+    paint: { "text-color": "#ffffff" } });
+}
+let halteGeo = { type: "FeatureCollection", features: [] }, halteNach = {}, halteLaden = Promise.resolve();
+function zeigeHalt(h) {
+  new maplibregl.Popup({ closeButton: false, offset: 12 }).setLngLat([h.lon, h.lat])
+    .setHTML(`<b>${haltTitel(h)}</b><br>${haltZeit(h)}`).addTo(karte);
+}
+for (const s of ["halt-punkt", "park-kreis"]) {
+  karte.on("click", s, (e) => { const h = halteNach[e.features[0].properties.id]; if (h) zeigeHalt(h); });
+  karte.on("mouseenter", s, () => (karte.getCanvas().style.cursor = "pointer"));
+  karte.on("mouseleave", s, () => (karte.getCanvas().style.cursor = ""));
+}
+function ladeHalte() {
+  halteLaden = api(`/api/halte?${abfrage()}`).then((d) => {
+    halteNach = {};
+    for (const h of d.halte) halteNach[h.id] = h;
+    halteGeo = { type: "FeatureCollection", features: d.halte.map((h) => ({ type: "Feature", properties: { id: h.id, p: h.p }, geometry: { type: "Point", coordinates: [h.lon, h.lat] } })) };
+    karte.getSource("halte")?.setData(halteGeo);
+  }).catch(() => {});
+  return halteLaden;
 }
 karte.on("style.load", spurenEinrichten);
 for (const s of ["kern", "roh"]) {
@@ -233,10 +282,36 @@ async function ladeKarte(zoomen) {
     for (const q of p) grenzen.extend(q);
   }
   grenzenAlt = grenzen.isEmpty() ? null : grenzen;
+  grobModus = grob; feinGeladen = new Set();
   const quelle = karte.getSource("spuren");
   if (quelle) quelle.setData(daten);
   if (zoomen && grenzenAlt) karte.fitBounds(grenzenAlt, { padding: 60, maxZoom: 15, duration: 600 });
+  else setTimeout(feinNachladen, 300);
 }
+
+// Bei „Jahr“ und „Alles“ kommen erst grobe Linien. Wer hineinzoomt, bekommt für den sichtbaren
+// Ausschnitt die genauen Linien nachgeladen – so liegen sie wieder exakt auf der Straße.
+let grobModus = false, feinGeladen = new Set(), feinLaeuft = false;
+async function feinNachladen() {
+  if (!grobModus || feinLaeuft || karte.getZoom() < 12 || !karte.getLayer("kern")) return;
+  const ids = [...new Set(karte.queryRenderedFeatures({ layers: ["kern"] }).map((f) => f.properties.id))]
+    .filter((id) => !feinGeladen.has(id)).slice(0, 600);
+  if (!ids.length) return;
+  const nr = ladeNr; feinLaeuft = true;
+  try {
+    const d = await post("/api/linien_fein", { ids });
+    if (nr !== ladeNr) return;
+    const nachId = new Map(daten.features.map((f) => [f.properties.id, f]));
+    for (const l of d.linien) {
+      const f = nachId.get(l.id), p = dekodiere(l.s);
+      if (f && p.length > 1) f.geometry.coordinates = p;
+    }
+    ids.forEach((id) => feinGeladen.add(id));
+    karte.getSource("spuren")?.setData(daten);
+  } catch (e) { /* beim nächsten Verschieben wieder versuchen */ }
+  finally { feinLaeuft = false; }
+}
+karte.on("moveend", feinNachladen);
 
 function waehle(id) {
   gewaehlt = gewaehlt === id ? null : id;
@@ -283,10 +358,13 @@ async function ladeListe(neu) {
   $("listeInnen").querySelector(".mehr")?.remove();
   let letzterTag = $("listeInnen").dataset.letzterTag || "";
   if (neu) letzterTag = "";
+  await halteLaden;
   const html = [];
   for (const s of d.strecken) {
     const t = new Date(s.start * 1000).toLocaleDateString("de-DE", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
     if (t !== letzterTag) { html.push(`<div class="tag"><span>${t}</span></div>`); letzterTag = t; }
+    const h = halteNach[s.id];
+    if (h) html.push(`<div class="zeile halt" data-halt="${esc(s.id)}"><span class="hp${h.p ? "" : " h"}">${h.p ? "P" : ""}</span><div class="t">${haltTitel(h)}<small>${haltZeit(h)}</small></div></div>`);
     const marke = s.status === "fertig" ? (s.geschaetzt ? '<span class="marke">geschätzt</span>' : "") : s.status === "fehler" ? '<span class="marke f">ohne Straße</span>' : '<span class="marke w">wartet</span>';
     html.push(`<div class="zeile" data-id="${esc(s.id)}"><span class="punkt" style="background:${(FARBE[s.art] || FARBE.auto)[1]}"></span><div class="t">${uhr(s.start)} – ${uhr(s.ende)} · ${NAME[s.art] || s.art}<small>${dauer(s.ende - s.start)}${s.quelle === "google" ? " · aus Google-Zeitachse" : ""}</small></div>${marke}<b>${km(s.distanz)}</b></div>`);
   }
@@ -298,6 +376,11 @@ async function ladeListe(neu) {
 $("listeInnen").addEventListener("click", (ev) => {
   if (ev.target.closest(".mehr")) return ladeListe(false);
   const z = ev.target.closest(".zeile"); if (!z) return;
+  if (z.dataset.halt) {
+    const h = halteNach[z.dataset.halt]; zeigeAnsicht("karte");
+    if (h) setTimeout(() => { karte.flyTo({ center: [h.lon, h.lat], zoom: 16, duration: 700 }); zeigeHalt(h); }, 50);
+    return;
+  }
   zeigeAnsicht("karte"); gewaehlt = null;
   const id = z.dataset.id;
   setTimeout(() => waehle(id), 50);
@@ -322,7 +405,7 @@ function alles(zoomen = true) {
   document.querySelectorAll("[data-art]").forEach((b) => b.classList.toggle("an", b.dataset.art === art));
   gewaehlt = null;
   if (karte.getLayer("gewaehlt")) karte.setFilter("gewaehlt", ["==", ["get", "id"], ""]);
-  ladeKarte(zoomen); ladeSummen(); ladeStand();
+  ladeHalte(); ladeKarte(zoomen); ladeSummen(); ladeStand();
   if (ansicht === "strecken") ladeListe(true);
 }
 document.querySelectorAll("[data-ansicht]").forEach((b) => b.onclick = () => zeigeAnsicht(b.dataset.ansicht));

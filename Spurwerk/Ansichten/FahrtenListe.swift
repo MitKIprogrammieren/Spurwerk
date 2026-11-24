@@ -73,6 +73,12 @@ struct FahrtenListe: View {
                 }
                 Section {
                     ForEach(fahrten) { fahrt in
+                        // Was nach dieser Strecke kam: geparkt oder Aufenthalt (neueste oben, also darüber)
+                        if let halt = cache.halteNach[fahrt.id],
+                           artFilter == nil || (halt.parken ? artFilter == .auto : artFilter != .auto) {
+                            HaltZeile(halt: halt)
+                                .deleteDisabled(true)
+                        }
                         NavigationLink {
                             FahrtDetail(fahrt: fahrt)
                         } label: {

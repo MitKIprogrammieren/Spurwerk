@@ -98,7 +98,7 @@ actor SyncArbeiter {
 
     static func holen(_ url: URL) async throws -> [String: Any] {
         var anfrage = URLRequest(url: url)
-        anfrage.timeoutInterval = 60
+        anfrage.timeoutInterval = 150
         let (daten, antwort) = try await URLSession.shared.data(for: anfrage)
         guard (antwort as? HTTPURLResponse)?.statusCode == 200,
               let json = try JSONSerialization.jsonObject(with: daten) as? [String: Any] else {

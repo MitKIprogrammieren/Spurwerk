@@ -48,6 +48,10 @@ def einrichten():
         CREATE INDEX IF NOT EXISTS i_status ON strecken(status);
         CREATE INDEX IF NOT EXISTS i_geaendert ON strecken(geaendert);
     """)
+    spalten = {r[1] for r in db().execute("PRAGMA table_info(strecken)")}
+    if "ziel_lat" not in spalten:   # Endpunkt jeder Strecke – für Halte und Parkplätze
+        db().execute("ALTER TABLE strecken ADD COLUMN ziel_lat REAL")
+        db().execute("ALTER TABLE strecken ADD COLUMN ziel_lon REAL")
     # Abgleich, der beim letzten Beenden mitten drin war, neu anstoßen
     db().execute("UPDATE strecken SET status='wartet' WHERE status='laeuft'")
     db().commit()
@@ -283,7 +287,8 @@ def hochladen(liste):
         db().execute("""INSERT INTO strecken(id, art, start, ende, distanz, quelle, status, punkte, dichte, geaendert)
                         VALUES(?,?,?,?,?,?,?,?,?,?)
                         ON CONFLICT(id) DO UPDATE SET art=excluded.art, start=excluded.start, ende=excluded.ende,
-                        distanz=excluded.distanz, quelle=excluded.quelle, punkte=excluded.punkte, dichte=excluded.dichte""",
+                        distanz=excluded.distanz, quelle=excluded.quelle, punkte=excluded.punkte, dichte=excluded.dichte,
+                        ziel_lat=NULL, ziel_lon=NULL""",
                      (sid, art, float(s.get("start", 0)), float(s.get("ende", s.get("start", 0))),
                       float(s.get("distanz", 0)), s.get("quelle", "app"), "wartet", json.dumps(punkte), dichte, time.time()))
         if s.get("spur"):
@@ -311,6 +316,40 @@ def bereich(q):
         sql += " AND art IN (%s)" % ",".join("?" * len(arten))
         args += arten
     return sql, args
+
+
+def halte_alle():
+    """Halte wie in der App: Parken von einer Autofahrt bis zur nächsten, Aufenthalt nach Fuß-/Radstrecken."""
+    fehlend = db().execute("SELECT id, punkte FROM strecken WHERE ziel_lat IS NULL").fetchall()
+    if fehlend:
+        neu = []
+        for z in fehlend:
+            p = json.loads(z["punkte"] or "[]")
+            if p:
+                neu.append((p[-1][0], p[-1][1], z["id"]))
+        db().executemany("UPDATE strecken SET ziel_lat=?, ziel_lon=? WHERE id=?", neu)
+        db().commit()
+    s = db().execute("SELECT id, art, start, ende, ziel_lat, ziel_lon FROM strecken "
+                     "WHERE ziel_lat IS NOT NULL ORDER BY start").fetchall()
+    naechstes_auto = [None] * len(s)
+    letztes = None
+    for i in range(len(s) - 1, -1, -1):
+        naechstes_auto[i] = letztes
+        if s[i]["art"] == "auto":
+            letztes = i
+    halte = []
+    for i, a in enumerate(s):
+        if a["art"] == "auto":
+            j = naechstes_auto[i]
+            bis = s[j]["start"] if j is not None else None
+            if bis is not None and not (180 <= bis - a["ende"] <= 30 * 86400):
+                continue
+            halte.append({"id": a["id"], "p": 1, "lat": a["ziel_lat"], "lon": a["ziel_lon"], "von": a["ende"], "bis": bis})
+        elif i + 1 < len(s):
+            d = s[i + 1]["start"] - a["ende"]
+            if 300 <= d <= 2 * 86400:
+                halte.append({"id": a["id"], "p": 0, "lat": a["ziel_lat"], "lon": a["ziel_lon"], "von": a["ende"], "bis": s[i + 1]["start"]})
+    return halte
 
 
 def status():
@@ -379,6 +418,14 @@ class Handler(BaseHTTPRequestHandler):
                         if len(p) > 1:
                             linien.append({"id": z["id"], "a": z["art"], "s": kodieren(vereinfachen(p, 35 if spalte == "grob" else 8)), "f": 0, "x": 0})
                 return self._send(200, {"linien": linien})
+            if url.path == "/api/halte":
+                von = float(q.get("von", ["0"])[0] or 0)
+                bis = float(q.get("bis", ["1e12"])[0] or 1e12)
+                arten = [a for a in q.get("art", [""])[0].split(",") if a in PROFIL]
+                jetzt = time.time()
+                out = [h for h in halte_alle() if h["von"] < bis and (h["bis"] or jetzt) > von
+                       and (not arten or ("auto" in arten if h["p"] else any(a != "auto" for a in arten)))]
+                return self._send(200, {"halte": out[-3000:]})
             if url.path == "/api/abholen":
                 seit = float(q.get("seit", ["0"])[0] or 0)
                 zeilen = db().execute("SELECT id, status, fehler, spur, geaendert FROM strecken WHERE geaendert > ? AND status IN ('fertig','fehler') ORDER BY geaendert LIMIT 500",
@@ -400,6 +447,12 @@ class Handler(BaseHTTPRequestHandler):
             daten = json.loads(self.rfile.read(laenge) or b"{}")
             if url.path == "/api/hochladen":
                 return self._send(200, {"ok": True, "anzahl": hochladen(daten.get("strecken", []))})
+            if url.path == "/api/linien_fein":
+                ids = [str(x) for x in daten.get("ids", [])][:600]
+                linien = []
+                for z in db().execute("SELECT id, fein FROM strecken WHERE fein IS NOT NULL AND id IN (%s)" % ",".join("?" * len(ids)), ids) if ids else []:
+                    linien.append({"id": z["id"], "s": z["fein"]})
+                return self._send(200, {"linien": linien})
             if url.path == "/api/neu_abgleichen":
                 ids = [str(x) for x in daten.get("ids", [])]
                 db().executemany("UPDATE strecken SET status='wartet' WHERE id=?", [(i,) for i in ids])

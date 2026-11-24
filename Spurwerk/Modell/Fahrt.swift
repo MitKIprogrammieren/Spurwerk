@@ -199,6 +199,8 @@ enum Format {
     static func dauer(_ sekunden: TimeInterval) -> String {
         let min = Int(sekunden) / 60
         if min < 60 { return "\(min) min" }
-        return "\(min / 60) h \(min % 60) min"
+        let std = min / 60
+        if std >= 24 { return "\(std / 24) Tg \(std % 24) h" }
+        return "\(std) h \(min % 60) min"
     }
 }
