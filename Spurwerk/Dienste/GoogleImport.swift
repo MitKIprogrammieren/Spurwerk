@@ -20,6 +20,7 @@ enum GoogleImport {
     struct Ergebnis {
         var neu = 0
         var doppelt = 0
+        var verbessert = 0
         var uebersprungen = 0
     }
 
@@ -27,6 +28,14 @@ enum GoogleImport {
         var lat: Double
         var lon: Double
         var zeit: Date
+    }
+
+    /// Aufenthalt laut Google – zeigt, wo eine Fahrt wirklich endete bzw. begann.
+    private struct Aufenthalt {
+        var start: Date
+        var ende: Date
+        var lat: Double
+        var lon: Double
     }
 
     private struct Aktivitaet {
@@ -43,20 +52,29 @@ enum GoogleImport {
         let json = try JSONSerialization.jsonObject(with: daten)
         var aktivitaeten: [Aktivitaet] = []
         var pfad: [ZeitPunkt] = []
+        var aufenthalte: [Aufenthalt] = []
 
         if let liste = json as? [[String: Any]] {
             // iPhone-Format: Liste aus Aktivitäten, Besuchen und Pfad-Stücken
-            for eintrag in liste { segmentLesen(eintrag, &aktivitaeten, &pfad) }
+            for eintrag in liste { segmentLesen(eintrag, &aktivitaeten, &pfad, &aufenthalte) }
         } else if let objekt = json as? [String: Any] {
             if let segmente = objekt["semanticSegments"] as? [[String: Any]] {
-                for eintrag in segmente { segmentLesen(eintrag, &aktivitaeten, &pfad) }
+                for eintrag in segmente { segmentLesen(eintrag, &aktivitaeten, &pfad, &aufenthalte) }
             }
             if let alte = objekt["timelineObjects"] as? [[String: Any]] {
                 for eintrag in alte {
                     if let seg = eintrag["activitySegment"] as? [String: Any] { altesSegmentLesen(seg, &aktivitaeten) }
+                    if let pv = eintrag["placeVisit"] as? [String: Any],
+                       let ort = e7(pv["location"]),
+                       let dauer = pv["duration"] as? [String: Any],
+                       let von = datum(dauer["startTimestamp"]) ?? datum(dauer["startTimestampMs"]) {
+                        let bis = datum(dauer["endTimestamp"]) ?? datum(dauer["endTimestampMs"]) ?? von
+                        aufenthalte.append(Aufenthalt(start: von, ende: bis, lat: ort.0, lon: ort.1))
+                    }
                 }
             }
         }
+        aufenthalte.sort { $0.start < $1.start }
 
         // Pfad-Punkte den Aktivitäten zuordnen (nach Zeit)
         pfad.sort { $0.zeit < $1.zeit }
@@ -66,8 +84,20 @@ enum GoogleImport {
             a.punkte.append(contentsOf: innen)
             a.punkte.sort { $0.zeit < $1.zeit }
             guard a.punkte.count >= 2 else { continue }
-            let punkte = a.punkte.map {
+            var punkte = a.punkte.map {
                 Punkt(lat: $0.lat, lon: $0.lon, zeit: $0.zeit.timeIntervalSince1970, genauigkeit: 50, tempo: -1)
+            }
+            // Google lässt Fahrten oft ein Stück vor dem Ziel enden (oder nach dem Start beginnen).
+            // Der Aufenthalt direkt danach bzw. davor zeigt, wo es wirklich war.
+            if let b = aufenthalte.first(where: { $0.start >= a.ende.addingTimeInterval(-300) && $0.start <= a.ende.addingTimeInterval(900) }),
+               let letzter = punkte.last,
+               (20...3000).contains(Halt.meter(letzter.lat, letzter.lon, b.lat, b.lon)) {
+                punkte.append(Punkt(lat: b.lat, lon: b.lon, zeit: a.ende.timeIntervalSince1970 + 1, genauigkeit: 30, tempo: -1))
+            }
+            if let b = aufenthalte.last(where: { $0.ende <= a.start.addingTimeInterval(300) && $0.ende >= a.start.addingTimeInterval(-900) }),
+               let erster = punkte.first,
+               (20...3000).contains(Halt.meter(erster.lat, erster.lon, b.lat, b.lon)) {
+                punkte.insert(Punkt(lat: b.lat, lon: b.lon, zeit: a.start.timeIntervalSince1970 - 1, genauigkeit: 30, tempo: -1), at: 0)
             }
             let distanz = a.distanz > 0 ? a.distanz : luftlinie(punkte)
             let art = FahrtArt.plausibel(a.art, meter: distanz, sekunden: a.ende.timeIntervalSince(a.start))
@@ -78,9 +108,15 @@ enum GoogleImport {
     }
 
     /// Ein Eintrag im iPhone- oder Android-Format.
-    private static func segmentLesen(_ e: [String: Any], _ aktivitaeten: inout [Aktivitaet], _ pfad: inout [ZeitPunkt]) {
+    private static func segmentLesen(_ e: [String: Any], _ aktivitaeten: inout [Aktivitaet], _ pfad: inout [ZeitPunkt],
+                                     _ aufenthalte: inout [Aufenthalt]) {
         guard let start = datum(e["startTime"]) else { return }
         let ende = datum(e["endTime"]) ?? start
+
+        if let v = e["visit"] as? [String: Any], let top = v["topCandidate"] as? [String: Any],
+           let ort = koordinate(top["placeLocation"]) {
+            aufenthalte.append(Aufenthalt(start: start, ende: ende, lat: ort.0, lon: ort.1))
+        }
 
         if let tp = e["timelinePath"] as? [[String: Any]] {
             for p in tp {
@@ -145,7 +181,6 @@ enum GoogleImport {
             if text.isEmpty, let typ = typ?.lowercased() {
                 if typ.contains("home") { text = "Zuhause" } else if typ.contains("work") { text = "Arbeit" }
             }
-            guard !text.isEmpty else { return }
             ergebnis.append(OrtBesuch(lat: ort.0, lon: ort.1, name: text))
         }
 
@@ -171,16 +206,29 @@ enum GoogleImport {
     static func speichern(_ strecken: [Strecke], in context: ModelContext) -> Ergebnis {
         var ergebnis = Ergebnis()
         let vorhanden = (try? context.fetch(FetchDescriptor<Fahrt>())) ?? []
-        var belegt = Set(vorhanden.map { "\($0.artText)-\(Int($0.start.timeIntervalSince1970 / 120))" })
+        // Schlüssel nur aus der Startzeit: eine Strecke, deren Art du geändert hast, bleibt dieselbe
+        var belegt: [Int: Fahrt] = [:]
+        for f in vorhanden { belegt[Int(f.start.timeIntervalSince1970 / 120)] = f }
 
         for s in strecken {
-            let schluessel = "\(s.art.rawValue)-\(Int(s.start.timeIntervalSince1970 / 120))"
-            if belegt.contains(schluessel) {
-                ergebnis.doppelt += 1
+            let schluessel = Int(s.start.timeIntervalSince1970 / 120)
+            if let alt = belegt[schluessel] ?? belegt[schluessel - 1] ?? belegt[schluessel + 1] {
+                // Gleiche Google-Strecke, aber jetzt mit besseren End-/Startpunkten → übernehmen
+                if alt.quelle == "google", alt.status != .aufnahme, s.punkte.count != alt.punkte.count {
+                    alt.punkte = s.punkte
+                    alt.ende = s.ende
+                    alt.dichte = mittlererAbstand(s.punkte)
+                    alt.status = .wartet
+                    alt.mussHoch = true
+                    ergebnis.verbessert += 1
+                    if ergebnis.verbessert % 300 == 0 { try? context.save() }
+                } else {
+                    ergebnis.doppelt += 1
+                }
                 continue
             }
-            belegt.insert(schluessel)
-            let fahrt = Fahrt(start: s.start, art: s.art)
+            belegt[schluessel] = Fahrt(start: s.start, art: s.art)
+            let fahrt = belegt[schluessel]!
             fahrt.ende = s.ende
             fahrt.punkte = s.punkte
             fahrt.distanzMeter = s.distanz

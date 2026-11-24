@@ -40,8 +40,16 @@ struct Halt: Identifiable, Hashable, Sendable {
         let art: FahrtArt
         let start: Date
         let ende: Date
+        let startLat: Double
+        let startLon: Double
         let zielLat: Double
         let zielLon: Double
+    }
+
+    static func meter(_ aLat: Double, _ aLon: Double, _ bLat: Double, _ bLon: Double) -> Double {
+        let dy = (bLat - aLat) * 111_320
+        let dx = (bLon - aLon) * 111_320 * cos(aLat * .pi / 180)
+        return (dx * dx + dy * dy).squareRoot()
     }
 
     /// Leitet alle Halte aus den Strecken ab (nach Startzeit sortiert übergeben).
@@ -58,14 +66,18 @@ struct Halt: Identifiable, Hashable, Sendable {
             let a = s[i]
             if a.art == .auto {
                 let bis = naechstesAuto[i].map { s[$0].start }
-                if let bis {
-                    let d = bis.timeIntervalSince(a.ende)
+                if let j = naechstesAuto[i] {
+                    let d = s[j].start.timeIntervalSince(a.ende)
                     guard d >= 3 * 60, d <= 30 * 86_400 else { continue }
+                    // Die nächste Autofahrt muss dort losgehen, wo das Auto stand – sonst fehlt
+                    // dazwischen nur ein Stück Aufzeichnung, und es war kein Parken.
+                    guard meter(a.zielLat, a.zielLon, s[j].startLat, s[j].startLon) <= 1000 else { continue }
                 }
                 halte.append(Halt(nachFahrt: a.id, lat: a.zielLat, lon: a.zielLon, von: a.ende, bis: bis, parken: true))
             } else if i + 1 < s.count {
                 let d = s[i + 1].start.timeIntervalSince(a.ende)
                 guard d >= 5 * 60, d <= 2 * 86_400 else { continue }
+                guard meter(a.zielLat, a.zielLon, s[i + 1].startLat, s[i + 1].startLon) <= 500 else { continue }
                 halte.append(Halt(nachFahrt: a.id, lat: a.zielLat, lon: a.zielLon, von: a.ende, bis: s[i + 1].start, parken: false))
             }
         }
@@ -139,7 +151,26 @@ final class OrtNamen: ObservableObject {
             besuche.append(b)
         }
         version &+= 1
+        orteVersion &+= 1
         speichern()
+    }
+
+    /// Zählt hoch, wenn neue Google-Orte dazukommen (dann Halte neu einrasten).
+    @Published private(set) var orteVersion = 0
+
+    /// Liegt ein Ort, an dem Google dich gesehen hat, in der Nähe (600 m), gilt dessen Position.
+    /// Google-Strecken enden oft ein Stück vor dem eigentlichen Ziel, z. B. noch auf der Autobahn.
+    func einrasten(_ lat: Double, _ lon: Double) -> (Double, Double)? {
+        let kx = cos(lat * .pi / 180) * 111_320
+        var bester: (Double, OrtBesuch)?
+        for b in besuche {
+            let dy = (b.lat - lat) * 111_320
+            guard abs(dy) < 600 else { continue }
+            let dx = (b.lon - lon) * kx
+            let d = dx * dx + dy * dy
+            if d < 600 * 600, d < (bester?.0 ?? .infinity) { bester = (d, b) }
+        }
+        return bester.map { ($0.1.lat, $0.1.lon) }
     }
 
     private func bekannterOrt(_ lat: Double, _ lon: Double) -> String? {
@@ -150,7 +181,7 @@ final class OrtNamen: ObservableObject {
             guard abs(dy) < 120 else { continue }
             let dx = (b.lon - lon) * kx
             let d = dx * dx + dy * dy
-            if d < 120 * 120, d < (bester?.0 ?? .infinity) { bester = (d, b.name) }
+            if !b.name.isEmpty, d < 120 * 120, d < (bester?.0 ?? .infinity) { bester = (d, b.name) }
         }
         return bester?.1
     }

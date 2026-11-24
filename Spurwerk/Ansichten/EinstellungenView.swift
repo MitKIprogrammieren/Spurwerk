@@ -135,7 +135,7 @@ struct EinstellungenView: View {
         importLaeuft = true
         importMeldung = nil
         Task {
-            var neu = 0, doppelt = 0, unlesbar: [String] = []
+            var neu = 0, doppelt = 0, verbessert = 0, unlesbar: [String] = []
             for (nr, url) in urls.enumerated() {
                 importMeldung = urls.count > 1 ? "Datei \(nr + 1) von \(urls.count): \(url.lastPathComponent)" : nil
                 let zugriff = url.startAccessingSecurityScopedResource()
@@ -151,20 +151,21 @@ struct EinstellungenView: View {
                     let ergebnis = GoogleImport.speichern(strecken, in: context)
                     neu += ergebnis.neu
                     doppelt += ergebnis.doppelt
+                    verbessert += ergebnis.verbessert
                 } catch {
                     unlesbar.append(url.lastPathComponent)
                 }
             }
             abgleich.geaendert()
-            var text = neu + doppelt == 0
+            var text = neu + doppelt + verbessert == 0
                 ? "Keine Auto-, Fuß- oder Radstrecken gefunden."
-                : "\(neu) Strecken übernommen, \(doppelt) waren schon da. Sie werden jetzt nach und nach auf die Straßen gelegt."
+                : "\(neu) Strecken übernommen, \(verbessert) mit genaueren Start- und Zielpunkten verbessert, \(doppelt) unverändert. Neue und verbesserte Strecken werden jetzt auf die Straßen gelegt."
             if !unlesbar.isEmpty {
                 text += " Nicht lesbar: " + unlesbar.prefix(5).joined(separator: ", ") + (unlesbar.count > 5 ? " …" : "")
             }
             importMeldung = text
             importLaeuft = false
-            if neu > 0, let container = recorder.container {
+            if neu + verbessert > 0, let container = recorder.container {
                 Task { await abgleich.ausstehendeAbgleichen(container: container) }
             }
         }

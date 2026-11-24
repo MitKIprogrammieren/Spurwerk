@@ -78,6 +78,7 @@ final class SpurCache: ObservableObject {
         let distanz: Double
         let linie: MKPolyline
         let grob: [CLLocationCoordinate2D]
+        let anfang: CLLocationCoordinate2D
         let ziel: CLLocationCoordinate2D
     }
 
@@ -136,13 +137,13 @@ final class SpurCache: ObservableObject {
             fertig.reserveCapacity(neu.count)
             for r in neu {
                 let punkte = r.abgeglichen ? Koordinaten.ausDaten(r.daten) : SpurCache.rohPunkte(r.daten)
-                guard punkte.count > 1, let ziel = punkte.last else { continue }
+                guard punkte.count > 1, let anfang = punkte.first, let ziel = punkte.last else { continue }
                 let einfach = Vereinfachen.linie(punkte, toleranzMeter: 5)
                 let linie = MKPolyline(coordinates: einfach, count: einfach.count)
                 let grob = Vereinfachen.linie(einfach, toleranzMeter: 35)
                 fertig.append((r.id, Eintrag(kennung: r.kennung, art: r.art, abgeglichen: r.abgeglichen,
                                              geschaetzt: r.geschaetzt, start: r.start, ende: r.ende,
-                                             distanz: r.distanz, linie: linie, grob: grob, ziel: ziel)))
+                                             distanz: r.distanz, linie: linie, grob: grob, anfang: anfang, ziel: ziel)))
             }
             let gueltigFest = gueltig
             await MainActor.run {
@@ -160,13 +161,24 @@ final class SpurCache: ObservableObject {
         }
     }
 
+    /// Neue Google-Orte: Halte neu berechnen und einrasten.
+    func halteNeu() {
+        haltePruefen()
+        gruppenBauen()
+    }
+
     /// Halte aus allen Strecken ableiten (unabhängig vom Zeitraum).
     private func haltePruefen() {
         let stuecke = eintraege
             .map { Halt.Stueck(id: $0.key, art: $0.value.art, start: $0.value.start, ende: $0.value.ende,
+                               startLat: $0.value.anfang.latitude, startLon: $0.value.anfang.longitude,
                                zielLat: $0.value.ziel.latitude, zielLon: $0.value.ziel.longitude) }
             .sorted { $0.start < $1.start }
-        alleHalte = Halt.berechnen(stuecke)
+        let orte = OrtNamen.shared
+        alleHalte = Halt.berechnen(stuecke).map { h in
+            guard let (lat, lon) = orte.einrasten(h.lat, h.lon) else { return h }
+            return Halt(nachFahrt: h.nachFahrt, lat: lat, lon: lon, von: h.von, bis: h.bis, parken: h.parken)
+        }
         var nach: [UUID: Halt] = [:]
         for h in alleHalte { nach[h.nachFahrt] = h }
         halteNach = nach
@@ -413,6 +425,7 @@ struct KartenView: View {
                 if zoomWunsch { zoomWunsch = false; zoomNr += 1 }
             }
             .onChange(of: abgleich.version) { _, _ in cache.aktualisieren(container: recorder.container) }
+            .onChange(of: namen.orteVersion) { _, _ in cache.halteNeu() }
             .onChange(of: recorder.nimmtAuf) { _, _ in cache.aktualisieren(container: recorder.container) }
     }
 }
