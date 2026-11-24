@@ -1,0 +1,6 @@
+build/
+Spurwerk.xcodeproj/
+Spurwerk/Info.plist
+Spurwerk.ipa
+Payload/
+.DS_Store

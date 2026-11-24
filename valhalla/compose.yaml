@@ -1,0 +1,22 @@
+# Läuft auf dem Proxmox-NUC als Stack „spurwerk-valhalla“ (CT 100, Port 8002).
+# Beim ersten Start lädt er Deutschland von Geofabrik und baut das Straßennetz (dauert 1–2 Stunden).
+services:
+  valhalla:
+    image: ghcr.io/nilsnolde/docker-valhalla/valhalla:latest
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./daten:/custom_files
+    mem_limit: 5g
+    environment:
+      - tile_urls=https://download.geofabrik.de/europe/germany-latest.osm.pbf
+      - server_threads=2
+      - serve_tiles=True
+      - use_tiles_ignore_pbf=True
+      - force_rebuild=False
+      - build_elevation=False
+      - build_admins=True
+      - build_time_zones=True
+      - build_transit=False
+      - build_tar=True
