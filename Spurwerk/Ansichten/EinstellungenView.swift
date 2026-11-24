@@ -68,7 +68,7 @@ struct EinstellungenView: View {
                 } header: {
                     Text("Alter Verlauf")
                 } footer: {
-                    Text("In der Google-Maps-App: Profilbild → Einstellungen → Persönliche Inhalte → Zeitachsendaten exportieren. Die Datei hier auswählen. Übernommen werden Auto-, Fuß- und Radstrecken; sie werden danach auf die Straßen gelegt. Doppelte Strecken werden übersprungen.")
+                    Text("In der Google-Maps-App: Profilbild → Einstellungen → Persönliche Inhalte → Zeitachsendaten exportieren. Die Datei hier auswählen – auch mehrere auf einmal, z. B. alle Monatsdateien aus einem alten Takeout-Export. Übernommen werden Auto-, Fuß- und Radstrecken; sie werden danach auf die Straßen gelegt. Doppelte Strecken werden übersprungen.")
                 }
 
                 Section {
@@ -105,37 +105,48 @@ struct EinstellungenView: View {
                 }
             }
             .navigationTitle("Einstellungen")
-            .fileImporter(isPresented: $importZeigen, allowedContentTypes: [.json]) { ergebnis in
-                guard case .success(let url) = ergebnis else { return }
-                importieren(url)
+            .fileImporter(isPresented: $importZeigen, allowedContentTypes: [.json], allowsMultipleSelection: true) { ergebnis in
+                guard case .success(let urls) = ergebnis, !urls.isEmpty else { return }
+                importieren(urls)
             }
         }
     }
 
-    private func importieren(_ url: URL) {
+    /// Liest eine oder mehrere Zeitachsen-Dateien nacheinander ein (z. B. alle Takeout-Monatsdateien).
+    private func importieren(_ urls: [URL]) {
         importLaeuft = true
         importMeldung = nil
         Task {
-            let zugriff = url.startAccessingSecurityScopedResource()
-            defer { if zugriff { url.stopAccessingSecurityScopedResource() } }
-            do {
-                let daten = try Data(contentsOf: url)
-                // Einlesen kann bei großen Dateien dauern – nicht auf dem Hauptthread
-                let strecken = try await Task.detached(priority: .userInitiated) {
-                    try GoogleImport.lesen(daten)
-                }.value
-                let ergebnis = GoogleImport.speichern(strecken, in: context)
-                abgleich.geaendert()
-                importMeldung = strecken.isEmpty
-                    ? "Keine Auto-, Fuß- oder Radstrecken in der Datei gefunden."
-                    : "\(ergebnis.neu) Strecken übernommen, \(ergebnis.doppelt) waren schon da. Sie werden jetzt nach und nach auf die Straßen gelegt."
-                if let container = recorder.container {
-                    Task { await abgleich.ausstehendeAbgleichen(container: container) }
+            var neu = 0, doppelt = 0, unlesbar: [String] = []
+            for (nr, url) in urls.enumerated() {
+                importMeldung = urls.count > 1 ? "Datei \(nr + 1) von \(urls.count): \(url.lastPathComponent)" : nil
+                let zugriff = url.startAccessingSecurityScopedResource()
+                defer { if zugriff { url.stopAccessingSecurityScopedResource() } }
+                do {
+                    let daten = try Data(contentsOf: url)
+                    // Einlesen kann bei großen Dateien dauern – nicht auf dem Hauptthread
+                    let strecken = try await Task.detached(priority: .userInitiated) {
+                        try GoogleImport.lesen(daten)
+                    }.value
+                    let ergebnis = GoogleImport.speichern(strecken, in: context)
+                    neu += ergebnis.neu
+                    doppelt += ergebnis.doppelt
+                } catch {
+                    unlesbar.append(url.lastPathComponent)
                 }
-            } catch {
-                importMeldung = "Die Datei konnte nicht gelesen werden: \(error.localizedDescription)"
             }
+            abgleich.geaendert()
+            var text = neu + doppelt == 0
+                ? "Keine Auto-, Fuß- oder Radstrecken gefunden."
+                : "\(neu) Strecken übernommen, \(doppelt) waren schon da. Sie werden jetzt nach und nach auf die Straßen gelegt."
+            if !unlesbar.isEmpty {
+                text += " Nicht lesbar: " + unlesbar.prefix(5).joined(separator: ", ") + (unlesbar.count > 5 ? " …" : "")
+            }
+            importMeldung = text
             importLaeuft = false
+            if neu > 0, let container = recorder.container {
+                Task { await abgleich.ausstehendeAbgleichen(container: container) }
+            }
         }
     }
 }
