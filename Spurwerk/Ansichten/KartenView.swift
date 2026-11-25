@@ -167,6 +167,16 @@ final class SpurCache: ObservableObject {
         }
     }
 
+    /// Alle Autofahrten (Ende, Meter), nach Ende sortiert – für den Tachostand im Fahrtenbuch.
+    func autoKilometer() -> [(ende: Date, distanz: Double)] {
+        eintraege.values.filter { $0.art == .auto }.map { ($0.ende, $0.distanz) }.sorted { $0.ende < $1.ende }
+    }
+
+    /// Echter Start- und Zielpunkt einer Strecke.
+    func anfangZiel(_ id: UUID) -> (CLLocationCoordinate2D, CLLocationCoordinate2D)? {
+        eintraege[id].map { ($0.anfang, $0.ziel) }
+    }
+
     /// Neue Google-Orte: Halte neu berechnen und einrasten.
     func halteNeu() {
         haltePruefen()

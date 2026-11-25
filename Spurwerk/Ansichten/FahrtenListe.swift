@@ -43,8 +43,27 @@ struct FahrtenListe: View {
         if let c = recorder.container { Task { await abgleich.ausstehendeAbgleichen(container: c) } }
     }
 
+    @State private var buch = false
+
     var body: some View {
         NavigationStack {
+            Group {
+                if buch { FahrtenbuchView() } else { streckenListe }
+            }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                Picker("Ansicht", selection: $buch) {
+                    Text("Strecken").tag(false)
+                    Text("Fahrtenbuch").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 6)
+                .background(.bar)
+            }
+        }
+    }
+
+    private var streckenListe: some View {
             List {
                 Section {
                     ZeitLeiste()
@@ -144,7 +163,6 @@ struct FahrtenListe: View {
             .onChange(of: zeit.schluessel) { _, _ in grenze = 150; laden() }
             .onChange(of: artFilter) { _, _ in grenze = 150; laden() }
             .onChange(of: abgleich.version) { _, _ in laden() }
-        }
     }
 }
 

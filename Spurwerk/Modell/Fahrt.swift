@@ -78,6 +78,9 @@ final class Fahrt {
     var mussHoch: Bool = true
     /// Zählt hoch, wenn der NUC eine neue Linie geliefert hat (damit die Karte neu zeichnet)
     var spurVersion: Int = 0
+    /// Fahrtenbuch: arbeit, privat, dienstlich oder leer
+    var zweck: String = ""
+    var notiz: String = ""
 
     init(start: Date, art: FahrtArt = .auto) {
         self.start = start
