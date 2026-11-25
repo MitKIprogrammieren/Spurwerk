@@ -156,11 +156,39 @@ def valhalla(pfad, daten, timeout=120):
         except Exception:  # noqa: BLE001
             fehler = None
         raise RuntimeError(fehler or f"Valhalla meldet {e.code}") from None
-    linie = []
-    for leg in antwort.get("trip", {}).get("legs", []):
-        linie += dekodieren(leg.get("shape", ""))
-    if not linie:
+    # Bei Aufzeichnungslücken liefert Valhalla die Strecke in mehreren Stücken: das erste unter
+    # „trip“, die übrigen unter „alternates“. Alle Stücke in Fahrtreihenfolge zusammensetzen.
+    stuecke = [antwort] + [a for a in antwort.get("alternates", []) if a.get("trip")]
+
+    def reihenfolge(st):
+        orte = st.get("trip", {}).get("locations", [])
+        return min([o.get("original_index", 10**9) for o in orte] or [10**9])
+
+    teile = []
+    for st in sorted(stuecke, key=reihenfolge):
+        linie = []
+        for leg in st.get("trip", {}).get("legs", []):
+            linie += dekodieren(leg.get("shape", ""))
+        if linie:
+            teile.append(linie)
+    if not teile:
         raise RuntimeError("Keine Linie erhalten")
+    return teile
+
+
+def stuecke_verbinden(teile, art):
+    """Setzt die Stücke zusammen; Lücken dazwischen werden über die Straße geroutet."""
+    linie = list(teile[0])
+    for naechstes in teile[1:]:
+        a, b = linie[-1], naechstes[0]
+        if abstand(a, b) > 30:
+            try:
+                bruecke = valhalla("/route", {"locations": [{"lat": a[0], "lon": a[1]}, {"lat": b[0], "lon": b[1]}],
+                                              "costing": PROFIL.get(art, "auto"), "directions_type": "none"})[0]
+                linie += bruecke[1:]
+            except RuntimeError:
+                pass  # dann eben gerade Verbindung
+        linie += naechstes[1:] if linie and naechstes and linie[-1] == naechstes[0] else naechstes
     return linie
 
 
@@ -197,6 +225,7 @@ def abgleichen(punkte, art):
                                   "gps_accuracy": 30 if sparsam else 10,
                                   "breakage_distance": 10000 if sparsam else 3000,
                                   "interpolation_distance": 10}})
+            linie = stuecke_verbinden(linie, art)
         except RuntimeError:
             linie = None
             if sparsam:
@@ -224,7 +253,7 @@ def routen(teil, art):
         stueck = teil[start:ende]
         orte = [{"lat": p[0], "lon": p[1], "radius": 50,
                  "type": "break" if i in (0, len(stueck) - 1) else "through"} for i, p in enumerate(stueck)]
-        l = valhalla("/route", {"locations": orte, "costing": PROFIL.get(art, "auto"), "directions_type": "none"}, 60)
+        l = valhalla("/route", {"locations": orte, "costing": PROFIL.get(art, "auto"), "directions_type": "none"}, 60)[0]
         if linie and l:
             l = l[1:]
         linie += l

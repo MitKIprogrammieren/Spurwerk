@@ -77,9 +77,10 @@ actor SyncArbeiter {
                 guard let f = try modelContext.fetch(suche).first else { continue }
                 if f.mussHoch { continue }                 // hier geändert, aber noch nicht hochgeladen
                 let fertig = (e["status"] as? String) == "fertig"
-                if fertig && f.status == .fertig { continue } // hatten wir schon
+                // Auch schon fertige Strecken übernehmen: der NUC kann sie verbessert neu berechnet haben
                 if fertig, let s = e["spur"] as? String {
                     f.spur = Polyline.dekodieren(s, faktor: 1e6)
+                    f.spurVersion += 1
                     f.status = .fertig
                     f.fehlertext = nil
                 } else if !fertig {

@@ -128,7 +128,7 @@ final class SpurCache: ObservableObject {
             for f in alle where f.status != .aufnahme {
                 gueltig.insert(f.id)
                 let abgeglichen = f.status == .fertig && f.spurDaten != nil
-                let kennung = "\(f.statusText)-\(f.artText)-\(f.geschaetzt)-\(Int(f.distanzMeter))-\(Int(f.ende?.timeIntervalSince1970 ?? 0))"
+                let kennung = "\(f.statusText)-\(f.artText)-\(f.geschaetzt)-\(Int(f.distanzMeter))-\(Int(f.ende?.timeIntervalSince1970 ?? 0))-\(f.spurVersion)"
                 if bekannt[f.id] == kennung { continue }
                 let daten = abgeglichen ? (f.spurDaten ?? Data()) : f.rohDaten
                 neu.append(Roh(id: f.id, kennung: kennung, art: f.art, abgeglichen: abgeglichen,

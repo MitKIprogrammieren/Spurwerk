@@ -76,6 +76,8 @@ final class Fahrt {
     var dichte: Double = 0
     /// Muss (noch einmal) an den Spurwerk-Server geschickt werden.
     var mussHoch: Bool = true
+    /// Zählt hoch, wenn der NUC eine neue Linie geliefert hat (damit die Karte neu zeichnet)
+    var spurVersion: Int = 0
 
     init(start: Date, art: FahrtArt = .auto) {
         self.start = start
