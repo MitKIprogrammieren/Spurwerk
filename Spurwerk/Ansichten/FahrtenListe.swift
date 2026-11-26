@@ -95,13 +95,14 @@ struct FahrtenListe: View {
                         // Was nach dieser Strecke kam: geparkt oder Aufenthalt (neueste oben, also darüber)
                         if let halt = cache.halteNach[fahrt.id],
                            artFilter == nil || (halt.parken ? artFilter == .auto : artFilter != .auto) {
-                            HaltZeile(halt: halt)
+                            HaltZeile(halt: halt, eingerueckt: !halt.parken && cache.waehrendParken(halt.von))
                                 .deleteDisabled(true)
                         }
                         NavigationLink {
                             FahrtDetail(fahrt: fahrt)
                         } label: {
-                            FahrtZeile(fahrt: fahrt)
+                            FahrtZeile(fahrt: fahrt,
+                                       eingerueckt: fahrt.art != .auto && cache.waehrendParken(fahrt.start))
                         }
                         .disabled(fahrt.status == .aufnahme)
                     }
@@ -168,9 +169,11 @@ struct FahrtenListe: View {
 
 struct FahrtZeile: View {
     let fahrt: Fahrt
+    var eingerueckt = false
 
     var body: some View {
         HStack(spacing: 12) {
+            if eingerueckt { ParkEinzug() }
             Image(systemName: fahrt.art.symbol)
                 .foregroundStyle(fahrt.art.farbe)
                 .frame(width: 26)

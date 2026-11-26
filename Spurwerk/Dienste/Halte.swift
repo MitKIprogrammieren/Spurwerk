@@ -15,12 +15,14 @@ struct Halt: Identifiable, Hashable, Sendable {
     let parken: Bool
 
     var id: String { "\(nachFahrt.uuidString)-\(parken)" }
+    /// Kurzer Halt zwischen zwei Wegen zu Fuß/Rad (Kaffee, Einkauf …)
+    var pause: Bool { !parken && bis != nil && dauer < 60 * 60 }
     var koordinate: CLLocationCoordinate2D { CLLocationCoordinate2D(latitude: lat, longitude: lon) }
     var dauer: TimeInterval { (bis ?? Date()).timeIntervalSince(von) }
 
     var titel: String {
         if parken { return bis != nil && dauer < 15 * 60 ? "Kurzer Halt" : "Geparkt" }
-        return "Aufenthalt"
+        return pause ? "Pause" : "Aufenthalt"
     }
 
     var zeitText: String {
@@ -76,12 +78,38 @@ struct Halt: Identifiable, Hashable, Sendable {
                 halte.append(Halt(nachFahrt: a.id, lat: a.zielLat, lon: a.zielLon, von: a.ende, bis: bis, parken: true))
             } else if i + 1 < s.count {
                 let d = s[i + 1].start.timeIntervalSince(a.ende)
-                guard d >= 5 * 60, d <= 2 * 86_400 else { continue }
+                guard d >= 2 * 60, d <= 2 * 86_400 else { continue }
                 guard meter(a.zielLat, a.zielLon, s[i + 1].startLat, s[i + 1].startLon) <= 500 else { continue }
                 halte.append(Halt(nachFahrt: a.id, lat: a.zielLat, lon: a.zielLon, von: a.ende, bis: s[i + 1].start, parken: false))
             }
         }
-        return halte
+        return ohneDoppelte(halte)
+    }
+
+    /// Ein Aufenthalt, der in die Parkzeit am selben Ort fällt, wird nicht extra gezeigt
+    /// (z. B. Auto geparkt, zu Fuß unterwegs, wieder am Auto) – das Parken sagt schon alles.
+    private static func ohneDoppelte(_ halte: [Halt]) -> [Halt] {
+        let parken = halte.filter(\.parken).sorted { $0.von < $1.von }
+        guard !parken.isEmpty else { return halte }
+        return halte.filter { h in
+            guard !h.parken else { return true }
+            // letztes Parken, das vor diesem Aufenthalt begann
+            var lo = 0, hi = parken.count
+            while lo < hi {
+                let m = (lo + hi) / 2
+                if parken[m].von <= h.von { lo = m + 1 } else { hi = m }
+            }
+            for k in stride(from: lo - 1, through: max(0, lo - 3), by: -1) {
+                let p = parken[k]
+                let ende = p.bis ?? .distantFuture
+                let hEnde = h.bis ?? h.von
+                if ende >= hEnde.addingTimeInterval(-60),
+                   meter(p.lat, p.lon, h.lat, h.lon) <= 300 {
+                    return false
+                }
+            }
+            return true
+        }
     }
 }
 
@@ -227,6 +255,7 @@ extension Halt {
 /// Rundes „P“ fürs Parken, Pause-Symbol für Halte.
 struct HaltSymbol: View {
     let parken: Bool
+    var pause = false
 
     var body: some View {
         if parken {
@@ -236,6 +265,11 @@ struct HaltSymbol: View {
                 .frame(width: 22, height: 22)
                 .background(Circle().fill(Color(red: 0.11, green: 0.23, blue: 0.36)))
                 .overlay(Circle().strokeBorder(Halt.parkFarbe, lineWidth: 1.5))
+        } else if pause {
+            Image(systemName: "cup.and.saucer.fill")
+                .font(.system(size: 15))
+                .foregroundStyle(Halt.haltFarbe)
+                .frame(width: 22, height: 22)
         } else {
             Image(systemName: "pause.circle.fill")
                 .font(.system(size: 20))
@@ -246,12 +280,14 @@ struct HaltSymbol: View {
 
 struct HaltZeile: View {
     let halt: Halt
+    var eingerueckt = false
     @ObservedObject private var namen = OrtNamen.shared
 
     var body: some View {
         let name = namen.name(halt.lat, halt.lon)
         HStack(spacing: 12) {
-            HaltSymbol(parken: halt.parken)
+            if eingerueckt { ParkEinzug() }
+            HaltSymbol(parken: halt.parken, pause: halt.pause)
                 .frame(width: 26)
             VStack(alignment: .leading, spacing: 2) {
                 Text(name.map { "\(halt.titel) · \($0)" } ?? halt.titel)
@@ -266,6 +302,17 @@ struct HaltZeile: View {
         .padding(.vertical, 1)
         .listRowBackground((halt.parken ? Halt.parkFarbe : Halt.haltFarbe).opacity(0.08))
         .task { namen.anfragen(halt.lat, halt.lon) }
+    }
+}
+
+/// Senkrechte Linie in Park-Farbe: diese Zeile war, während das Auto stand.
+struct ParkEinzug: View {
+    var body: some View {
+        RoundedRectangle(cornerRadius: 1.5)
+            .fill(Halt.parkFarbe.opacity(0.7))
+            .frame(width: 3)
+            .padding(.vertical, -12)
+            .padding(.leading, 2)
     }
 }
 

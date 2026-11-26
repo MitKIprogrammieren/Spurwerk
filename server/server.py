@@ -4,6 +4,7 @@
 Das iPhone lädt neue Strecken hoch (/api/hochladen) und holt fertige Linien ab (/api/abholen).
 Der Abgleich läuft hier im Hintergrund, das iPhone muss dafür nicht offen sein.
 """
+import bisect
 import json
 import math
 import os
@@ -507,9 +508,18 @@ def halte_alle():
             halte.append({"id": a["id"], "p": 1, "lat": a["ziel_lat"], "lon": a["ziel_lon"], "von": a["ende"], "bis": bis})
         elif i + 1 < len(s):
             d = s[i + 1]["start"] - a["ende"]
-            if 300 <= d <= 2 * 86400 and abstand((a["ziel_lat"], a["ziel_lon"]), (s[i + 1]["start_lat"], s[i + 1]["start_lon"])) <= 500:
+            if 120 <= d <= 2 * 86400 and abstand((a["ziel_lat"], a["ziel_lon"]), (s[i + 1]["start_lat"], s[i + 1]["start_lon"])) <= 500:
                 halte.append({"id": a["id"], "p": 0, "lat": a["ziel_lat"], "lon": a["ziel_lon"], "von": a["ende"], "bis": s[i + 1]["start"]})
-    return halte
+    # Aufenthalt während der Parkzeit am selben Ort nicht doppelt zeigen
+    parken = [h for h in halte if h["p"]]
+    vons = [h["von"] for h in parken]
+    def doppelt(h):
+        k = bisect.bisect_right(vons, h["von"])
+        for p in parken[max(0, k - 3):k]:
+            if (p["bis"] is None or p["bis"] >= h["bis"] - 60) and abstand((p["lat"], p["lon"]), (h["lat"], h["lon"])) <= 300:
+                return True
+        return False
+    return [h for h in halte if h["p"] or not doppelt(h)]
 
 
 def status():

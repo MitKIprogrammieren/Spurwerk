@@ -65,6 +65,8 @@ final class SpurCache: ObservableObject {
     @Published private(set) var halte: [Halt] = []
     /// Halt direkt nach einer Strecke (für die Liste)
     @Published private(set) var halteNach: [UUID: Halt] = [:]
+    /// Zeiträume, in denen das Auto geparkt war (sortiert) – für die Einrückung in der Liste
+    private(set) var parkZeiten: [(von: Date, bis: Date)] = []
     /// Das Auto steht noch hier (letzte Autofahrt, höchstens drei Tage her)
     @Published private(set) var autoSteht: Halt?
 
@@ -192,6 +194,18 @@ final class SpurCache: ObservableObject {
         eintraege[id].map { ($0.anfang, $0.ziel) }
     }
 
+    /// Liegt dieser Zeitpunkt in einer Parkzeit? (dann war man ohne Auto unterwegs)
+    func waehrendParken(_ d: Date) -> Bool {
+        var lo = 0, hi = parkZeiten.count
+        while lo < hi {
+            let m = (lo + hi) / 2
+            if parkZeiten[m].von <= d { lo = m + 1 } else { hi = m }
+        }
+        guard lo > 0 else { return false }
+        let p = parkZeiten[lo - 1]
+        return d > p.von && d < p.bis
+    }
+
     /// Neue Google-Orte: Halte neu berechnen und einrasten.
     func halteNeu() {
         haltePruefen()
@@ -208,6 +222,7 @@ final class SpurCache: ObservableObject {
         alleHalte = Halt.berechnen(stuecke)
         var nach: [UUID: Halt] = [:]
         for h in alleHalte { nach[h.nachFahrt] = h }
+        parkZeiten = alleHalte.filter(\.parken).map { ($0.von, $0.bis ?? .distantFuture) }
         halteNach = nach
         if let letzter = alleHalte.last(where: { $0.parken && $0.bis == nil }),
            letzter.von > Date().addingTimeInterval(-3 * 86_400) {
