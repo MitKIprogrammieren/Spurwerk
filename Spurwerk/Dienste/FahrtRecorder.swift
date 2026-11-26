@@ -32,6 +32,10 @@ final class FahrtRecorder: NSObject, ObservableObject {
     private var bewegungLaeuft = false
     /// Nach einem verworfenen Mini-Fußweg eine Weile keine neue Fußaufnahme starten.
     private var fussPauseBis = Date.distantPast
+    /// Nach dem Verlassen des Parkplatz-Zauns: kurz GPS mitschreiben, bis klar ist, ob wir fahren.
+    private var probeBis: Date?
+    private var probePunkte: [Punkt] = []
+    private var letzteProbePruefung = Date.distantPast
 
     // MARK: - Einstellungen
 
@@ -87,15 +91,24 @@ final class FahrtRecorder: NSObject, ObservableObject {
             manager.requestWhenInUseAuthorization()
         }
         let fahrt = Fahrt(start: Date(), art: art)
+        // Was seit dem Verlassen des Parkplatzes schon mitgeschrieben wurde, gehört zur Fahrt
+        let vorlauf = art == .auto ? probePunkte : []
+        if let erster = vorlauf.first { fahrt.start = Date(timeIntervalSince1970: erster.zeit) }
+        probeBis = nil
+        probePunkte = []
         container.mainContext.insert(fahrt)
         try? container.mainContext.save()
 
         self.art = art
         aktuelleFahrt = fahrt
-        punkte = []
-        livePunkte = []
+        punkte = vorlauf
+        livePunkte = vorlauf.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
         liveDistanz = 0
-        letzterOrt = nil
+        for i in vorlauf.indices.dropFirst() {
+            liveDistanz += CLLocation(latitude: vorlauf[i - 1].lat, longitude: vorlauf[i - 1].lon)
+                .distance(from: CLLocation(latitude: vorlauf[i].lat, longitude: vorlauf[i].lon))
+        }
+        letzterOrt = vorlauf.last.map { CLLocation(latitude: $0.lat, longitude: $0.lon) }
         startZeit = fahrt.start
         letzteBewegung = Date()
         gehenSeit = nil
@@ -118,6 +131,7 @@ final class FahrtRecorder: NSObject, ObservableObject {
         }
         manager.allowsBackgroundLocationUpdates = true
         manager.showsBackgroundLocationIndicator = true
+        hintergrundSitzung?.invalidate()
         hintergrundSitzung = CLBackgroundActivitySession()
         manager.startUpdatingLocation()
 
@@ -151,6 +165,7 @@ final class FahrtRecorder: NSObject, ObservableObject {
             fahrt.status = .wartet
             fahrt.dichte = mittlererAbstand(punkte)
             fahrt.mussHoch = true
+            if fahrt.art == .auto, let p = punkte.last { parkZaunSetzen(lat: p.lat, lon: p.lon) }
         }
         try? context.save()
         livePunkte = []
@@ -249,6 +264,50 @@ final class FahrtRecorder: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Parkplatz-Zaun
+
+    /// Unsichtbarer Zaun (100 m) um das geparkte Auto. Fährst du los, weckt iOS die App beim
+    /// Verlassen des Zauns – deutlich früher als die stromsparende Ortung (erst nach ~500 m).
+    private func parkZaunSetzen(lat: Double, lon: Double) {
+        for r in manager.monitoredRegions where r.identifier == "parkplatz" { manager.stopMonitoring(for: r) }
+        guard automatikAuto, CLLocationManager.isMonitoringAvailable(for: CLCircularRegion.self) else { return }
+        let zaun = CLCircularRegion(center: CLLocationCoordinate2D(latitude: lat, longitude: lon),
+                                    radius: 100, identifier: "parkplatz")
+        zaun.notifyOnEntry = false
+        zaun.notifyOnExit = true
+        manager.startMonitoring(for: zaun)
+    }
+
+    fileprivate func parkZaunVerlassen() {
+        guard automatikAuto, !nimmtAuf else { return }
+        // Bis zu 2,5 Minuten GPS mitschreiben; fahren wir, beginnt die Fahrt mit diesen Punkten.
+        probeBis = Date().addingTimeInterval(150)
+        probePunkte = []
+        manager.activityType = .automotiveNavigation
+        manager.desiredAccuracy = kCLLocationAccuracyBestForNavigation
+        manager.distanceFilter = 5
+        manager.allowsBackgroundLocationUpdates = true
+        hintergrundSitzung?.invalidate()
+        hintergrundSitzung = CLBackgroundActivitySession()
+        manager.startUpdatingLocation()
+        // Falls keine Punkte mehr kommen (Auto steht doch): GPS nach Ablauf sicher wieder aus
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(155))
+            guard let self, let bis = self.probeBis, Date() >= bis else { return }
+            self.probeBeenden()
+        }
+    }
+
+    private func probeBeenden() {
+        probeBis = nil
+        probePunkte = []
+        guard !nimmtAuf else { return }
+        manager.stopUpdatingLocation()
+        manager.allowsBackgroundLocationUpdates = false
+        hintergrundSitzung?.invalidate()
+        hintergrundSitzung = nil
+    }
+
     /// Nach einem Aufwecken durch Ortswechsel: nachsehen, ob wir fahren oder laufen.
     private func nachAufweckenPruefen(_ ort: CLLocation) {
         guard automatik, !nimmtAuf else { return }
@@ -274,6 +333,20 @@ final class FahrtRecorder: NSObject, ObservableObject {
 
     fileprivate func orteEmpfangen(_ orte: [CLLocation]) {
         guard nimmtAuf else {
+            if let bis = probeBis {
+                guard Date() < bis else { probeBeenden(); return }
+                for ort in orte where ort.horizontalAccuracy > 0 && ort.horizontalAccuracy < 40 {
+                    probePunkte.append(Punkt(lat: ort.coordinate.latitude, lon: ort.coordinate.longitude,
+                                             zeit: ort.timestamp.timeIntervalSince1970,
+                                             genauigkeit: ort.horizontalAccuracy, tempo: ort.speed))
+                }
+                // Nicht bei jedem Punkt nachfragen – alle 15 s reicht
+                if let letzter = orte.last, letzter.speed > 8 || Date().timeIntervalSince(letzteProbePruefung) > 15 {
+                    letzteProbePruefung = Date()
+                    nachAufweckenPruefen(letzter)
+                }
+                return
+            }
             if let letzter = orte.last { nachAufweckenPruefen(letzter) }
             return
         }
@@ -314,4 +387,9 @@ extension FahrtRecorder: CLLocationManagerDelegate {
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {}
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didExitRegion region: CLRegion) {
+        guard region.identifier == "parkplatz" else { return }
+        Task { @MainActor in self.parkZaunVerlassen() }
+    }
 }

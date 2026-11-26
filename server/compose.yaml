@@ -297,11 +297,36 @@ configs:
       _stand = {"laeuft": False, "fertig_seit_start": 0, "fehler": None}
 
 
+      def anfang_ergaenzen(z, punkte):
+          """Die automatische Aufnahme startet erst, wenn das iPhone die Autofahrt sicher erkannt hat –
+          die ersten paar hundert Meter fehlen dann. Stand das Auto vorher in der Nähe (Ende der letzten
+          eigenen Autofahrt, höchstens 2 km entfernt), beginnt die Linie dort."""
+          if z["art"] != "auto" or z["quelle"] != "app" or not punkte:
+              return punkte
+          v = db().execute("SELECT ende, punkte, quelle FROM strecken WHERE art='auto' AND start < ? "
+                           "ORDER BY start DESC LIMIT 1", (z["start"],)).fetchone()
+          if not v or v["quelle"] != "app":
+              return punkte
+          vorher = json.loads(v["punkte"] or "[]")
+          if not vorher:
+              return punkte
+          ziel = vorher[-1]
+          weg = abstand(ziel, punkte[0])
+          pause = z["start"] - (v["ende"] or 0)
+          if 40 <= weg <= 2000 and 120 <= pause <= 30 * 86400:
+              return [[ziel[0], ziel[1], punkte[0][2] - max(30, weg / 8)]] + punkte
+          return punkte
+
+
+      def laenge(linie):
+          return sum(abstand(linie[i - 1], linie[i]) for i in range(1, len(linie)))
+
+
       def arbeiter():
           """Legt wartende Strecken nacheinander auf die Straße – neueste zuerst."""
           while True:
               try:
-                  z = db().execute("SELECT id, art, punkte FROM strecken WHERE status='wartet' ORDER BY start DESC LIMIT 1").fetchone()
+                  z = db().execute("SELECT id, art, punkte, quelle, start FROM strecken WHERE status='wartet' ORDER BY start DESC LIMIT 1").fetchone()
                   if not z:
                       _stand["laeuft"] = False
                       time.sleep(10)
@@ -310,8 +335,18 @@ configs:
                   db().execute("UPDATE strecken SET status='laeuft' WHERE id=?", (z["id"],))
                   db().commit()
                   punkte = json.loads(z["punkte"] or "[]")
+                  mit_anfang = anfang_ergaenzen(z, punkte)
                   try:
                       spur, dichte = abgleichen(punkte, z["art"])
+                      if mit_anfang is not punkte:
+                          # Ergänzten Anfang nur nehmen, wenn er kein Umweg ist (höchstens 1,6 × Luftlinie + 150 m)
+                          weg = abstand(mit_anfang[0], punkte[0])
+                          try:
+                              spur2, dichte2 = abgleichen(mit_anfang, z["art"])
+                              if laenge(spur2) - laenge(spur) <= 1.6 * weg + 150:
+                                  spur, dichte = spur2, dichte2
+                          except RuntimeError:
+                              pass
                       speichere_spur(z["id"], spur, dichte)
                       _stand["fertig_seit_start"] += 1
                       _stand["fehler"] = None
