@@ -62,6 +62,7 @@ struct HauptView: View {
         .preferredColorScheme(schema)
         .onChange(of: phase) { _, neu in
             guard neu == .active, let container = recorder.container else { return }
+            SpurCache.shared.imVordergrund()
             Task { await Abgleich.shared.ausstehendeAbgleichen(container: container) }
         }
         .task {

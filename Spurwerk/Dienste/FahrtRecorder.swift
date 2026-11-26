@@ -174,6 +174,32 @@ final class FahrtRecorder: NSObject, ObservableObject {
         Task { await Abgleich.shared.ausstehendeAbgleichen(container: container) }
     }
 
+    private func fortsetzen(_ fahrt: Fahrt) {
+        art = fahrt.art
+        aktuelleFahrt = fahrt
+        punkte = fahrt.punkte
+        livePunkte = punkte.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+        liveDistanz = fahrt.distanzMeter
+        letzterOrt = punkte.last.map { CLLocation(latitude: $0.lat, longitude: $0.lon) }
+        startZeit = fahrt.start
+        letzteBewegung = Date()
+        gehenSeit = nil
+        automatischGestartet = true
+        nimmtAuf = true
+        manager.activityType = art == .auto ? .automotiveNavigation : .fitness
+        manager.desiredAccuracy = art == .auto ? kCLLocationAccuracyBestForNavigation : kCLLocationAccuracyBest
+        manager.distanceFilter = art == .auto ? 5 : 3
+        manager.allowsBackgroundLocationUpdates = true
+        manager.showsBackgroundLocationIndicator = true
+        hintergrundSitzung?.invalidate()
+        hintergrundSitzung = CLBackgroundActivitySession()
+        manager.startUpdatingLocation()
+        pruefTimer?.invalidate()
+        pruefTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.stillstandPruefen() }
+        }
+    }
+
     private func zwischenspeichern() {
         guard let fahrt = aktuelleFahrt else { return }
         fahrt.punkte = punkte
@@ -209,11 +235,19 @@ final class FahrtRecorder: NSObject, ObservableObject {
         }
     }
 
-    /// Falls die App während einer Aufnahme beendet wurde: Strecke trotzdem behalten.
+    /// Falls die App während einer Aufnahme beendet wurde (z. B. von iOS wegen Speicher):
+    /// Liegt der letzte Punkt keine 5 Minuten zurück, geht dieselbe Fahrt einfach weiter.
+    /// Ältere Aufnahmen werden abgeschlossen und behalten.
     private func abgebrocheneFahrtenRetten() {
         guard let context = container?.mainContext else { return }
         let beschreibung = FetchDescriptor<Fahrt>(predicate: #Predicate { $0.statusText == "aufnahme" })
-        let offen = (try? context.fetch(beschreibung)) ?? []
+        var offen = ((try? context.fetch(beschreibung)) ?? []).sorted { $0.start > $1.start }
+        if !nimmtAuf, let neueste = offen.first, let letzter = neueste.punkte.last,
+           Date().timeIntervalSince1970 - letzter.zeit < 300,
+           manager.authorizationStatus == .authorizedAlways {
+            offen.removeFirst()
+            fortsetzen(neueste)
+        }
         for fahrt in offen {
             if fahrt.distanzMeter < fahrt.art.mindestStrecke {
                 context.delete(fahrt)

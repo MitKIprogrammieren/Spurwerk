@@ -113,8 +113,23 @@ final class SpurCache: ObservableObject {
         gruppenBauen()
     }
 
+    /// Im Hintergrund (z. B. während einer Fahrt) wird nicht neu aufgebaut – das kostet viel Speicher,
+    /// und iOS beendet Apps im Hintergrund, die zu viel Speicher brauchen. Nachgeholt wird beim Öffnen.
+    private var aufgeschoben: ModelContainer?
+
+    func imVordergrund() {
+        if let c = aufgeschoben {
+            aufgeschoben = nil
+            aktualisieren(container: c)
+        }
+    }
+
     func aktualisieren(container: ModelContainer?) {
         guard let container else { return }
+        guard UIApplication.shared.applicationState != .background else {
+            aufgeschoben = container
+            return
+        }
         if laeuft { nochmal = true; return }
         laeuft = true
         let bekannt = eintraege.mapValues(\.kennung)

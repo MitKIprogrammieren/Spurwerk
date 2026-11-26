@@ -181,11 +181,14 @@ def stuecke_verbinden(teile, art):
     linie = list(teile[0])
     for naechstes in teile[1:]:
         a, b = linie[-1], naechstes[0]
-        if abstand(a, b) > 30:
+        luft = abstand(a, b)
+        if luft > 30:
             try:
                 bruecke = valhalla("/route", {"locations": [{"lat": a[0], "lon": a[1]}, {"lat": b[0], "lon": b[1]}],
                                               "costing": PROFIL.get(art, "auto"), "directions_type": "none"})[0]
-                linie += bruecke[1:]
+                # Nur übernehmen, wenn sie kein Umweg ist (Einbahnstraßen, Auffahrten …) – sonst gerade Linie
+                if laenge(bruecke) <= 2 * luft + 50:
+                    linie += bruecke[1:]
             except RuntimeError:
                 pass  # dann eben gerade Verbindung
         linie += naechstes[1:] if linie and naechstes and linie[-1] == naechstes[0] else naechstes
@@ -275,7 +278,7 @@ _stand = {"laeuft": False, "fertig_seit_start": 0, "fehler": None}
 def anfang_ergaenzen(z, punkte):
     """Die automatische Aufnahme startet erst, wenn das iPhone die Autofahrt sicher erkannt hat –
     die ersten paar hundert Meter fehlen dann. Stand das Auto vorher in der Nähe (Ende der letzten
-    eigenen Autofahrt, höchstens 2 km entfernt), beginnt die Linie dort."""
+    eigenen Autofahrt, höchstens 250 m entfernt), beginnt die Linie dort."""
     if z["art"] != "auto" or z["quelle"] != "app" or not punkte:
         return punkte
     v = db().execute("SELECT ende, punkte, quelle FROM strecken WHERE art='auto' AND start < ? "
@@ -288,7 +291,8 @@ def anfang_ergaenzen(z, punkte):
     ziel = vorher[-1]
     weg = abstand(ziel, punkte[0])
     pause = z["start"] - (v["ende"] or 0)
-    if 40 <= weg <= 2000 and 120 <= pause <= 30 * 86400:
+    # Nur kleine Lücken füllen: über mehrere hundert Meter gibt es zu viele mögliche Wege
+    if 40 <= weg <= 250 and 120 <= pause <= 30 * 86400:
         return [[ziel[0], ziel[1], punkte[0][2] - max(30, weg / 8)]] + punkte
     return punkte
 
