@@ -214,6 +214,7 @@ struct FahrtDetail: View {
     @EnvironmentObject private var abgleich: Abgleich
     @State private var rohZeigen = false
     @State private var gpxDatei: URL?
+    @State private var korrigieren = false
 
     var body: some View {
         let roh = fahrt.rohKoordinaten
@@ -266,6 +267,12 @@ struct FahrtDetail: View {
                     Label("Erneut auf Straße legen", systemImage: "arrow.triangle.2.circlepath")
                 }
                 .disabled(abgleich.laeuft)
+                Button {
+                    korrigieren = true
+                } label: {
+                    Label("Strecke korrigieren", systemImage: "point.topleft.down.to.point.bottomright.curvepath")
+                }
+                .disabled(fahrt.status == .aufnahme)
                 if let gpxDatei {
                     ShareLink(item: gpxDatei) {
                         Label("Als GPX teilen", systemImage: "square.and.arrow.up")
@@ -277,5 +284,8 @@ struct FahrtDetail: View {
         .navigationTitle(fahrt.start.formatted(date: .abbreviated, time: .shortened))
         .navigationBarTitleDisplayMode(.inline)
         .task { gpxDatei = try? GPX.datei(fuer: fahrt) }
+        .sheet(isPresented: $korrigieren) {
+            StreckeKorrigierenView(fahrt: fahrt)
+        }
     }
 }

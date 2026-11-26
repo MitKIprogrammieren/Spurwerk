@@ -301,6 +301,60 @@ def laenge(linie):
     return sum(abstand(linie[i - 1], linie[i]) for i in range(1, len(linie)))
 
 
+def korrigieren(daten):
+    """Fehlendes Stück am Anfang oder Ende einer Strecke aus angetippten Wegpunkten ergänzen.
+    Mit "vorschau": true wird nur die Linie berechnet, sonst an die Strecke gehängt und neu abgeglichen."""
+    sid = str(daten.get("id", ""))
+    wo = "ende" if daten.get("wo") == "ende" else "anfang"
+    tipps = [[float(q[0]), float(q[1])] for q in daten.get("punkte", [])][:25]
+    z = db().execute("SELECT id, art, punkte FROM strecken WHERE id=?", (sid,)).fetchone()
+    if not z:
+        raise RuntimeError("Strecke ist auf dem NUC nicht bekannt")
+    punkte = json.loads(z["punkte"] or "[]")
+    if not punkte or not tipps:
+        return {"form": [], "laenge": 0, "namen": []}
+    wege = tipps + [punkte[0][:2]] if wo == "anfang" else [punkte[-1][:2]] + tipps
+    orte = [{"lat": a, "lon": b, "type": "break" if i in (0, len(wege) - 1) else "via"} for i, (a, b) in enumerate(wege)]
+    req = urllib.request.Request(VALHALLA + "/route", data=json.dumps(
+        {"locations": orte, "costing": PROFIL.get(z["art"], "auto"), "directions_type": "maneuvers",
+         "language": "de-DE"}).encode(), headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            antwort = json.loads(r.read())
+    except urllib.error.HTTPError:
+        raise RuntimeError("Zwischen diesen Punkten findet Valhalla keinen Weg") from None
+    form, namen = [], []
+    for leg in antwort.get("trip", {}).get("legs", []):
+        for mv in leg.get("maneuvers", []):
+            for n in mv.get("street_names", []):
+                if not namen or namen[-1] != n:
+                    namen.append(n)
+        stueck = dekodieren(leg.get("shape", ""))
+        form += stueck if not form else stueck[1:]
+    meter = laenge(form)
+    if daten.get("vorschau") or len(form) < 2:
+        return {"form": form, "laenge": meter, "namen": namen}
+
+    # Zeiten passend zur Aufnahme vergeben (~25 km/h), dann anhängen
+    neu = []
+    if wo == "anfang":
+        t = punkte[0][2]
+        for i in range(len(form) - 1, 0, -1):
+            t -= abstand(form[i - 1], form[i]) / 7.0
+            neu.insert(0, [form[i - 1][0], form[i - 1][1], t])
+        alle = neu + punkte
+    else:
+        t = punkte[-1][2]
+        for i in range(1, len(form)):
+            t += abstand(form[i - 1], form[i]) / 7.0
+            neu.append([form[i][0], form[i][1], t])
+        alle = punkte + neu
+    db().execute("UPDATE strecken SET punkte=?, start=?, ende=?, status='wartet', ziel_lat=NULL, ziel_lon=NULL, "
+                 "start_lat=NULL, start_lon=NULL WHERE id=?", (json.dumps(alle), alle[0][2], alle[-1][2], sid))
+    db().commit()
+    return {"form": form, "laenge": meter, "namen": namen, "punkte": alle}
+
+
 def arbeiter():
     """Legt wartende Strecken nacheinander auf die Straße – neueste zuerst."""
     while True:
@@ -531,6 +585,8 @@ class Handler(BaseHTTPRequestHandler):
                 db().executemany("UPDATE strecken SET status='wartet' WHERE id=?", [(i,) for i in ids])
                 db().commit()
                 return self._send(200, {"ok": True})
+            if url.path == "/api/korrigieren":
+                return self._send(200, korrigieren(daten))
             if url.path == "/api/loeschen":
                 ids = [str(x) for x in daten.get("ids", [])]
                 db().executemany("DELETE FROM strecken WHERE id=?", [(i,) for i in ids])
