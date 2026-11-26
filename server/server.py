@@ -302,56 +302,89 @@ def laenge(linie):
 
 
 def korrigieren(daten):
-    """Fehlendes Stück am Anfang oder Ende einer Strecke aus angetippten Wegpunkten ergänzen.
-    Mit "vorschau": true wird nur die Linie berechnet, sonst an die Strecke gehängt und neu abgeglichen."""
+    """Strecke von Hand korrigieren.
+    - wo = "anfang"/"ende": fehlendes Stück aus angetippten Punkten ergänzen. Die Punkte werden wie eine
+      Aufzeichnung auf die Straße gelegt (Map-Matching), so wählt Valhalla selbst die richtige Fahrbahn.
+    - kuerzen = "vorne"/"hinten" mit zeit: alle Punkte vor bzw. nach diesem Zeitpunkt löschen.
+    Mit "vorschau": true wird nur berechnet, sonst gespeichert und neu abgeglichen."""
     sid = str(daten.get("id", ""))
-    wo = "ende" if daten.get("wo") == "ende" else "anfang"
-    tipps = [[float(q[0]), float(q[1])] for q in daten.get("punkte", [])][:25]
     z = db().execute("SELECT id, art, punkte FROM strecken WHERE id=?", (sid,)).fetchone()
     if not z:
         raise RuntimeError("Strecke ist auf dem NUC nicht bekannt")
     punkte = json.loads(z["punkte"] or "[]")
+
+    def speichern(alle):
+        if len(alle) < 2:
+            raise RuntimeError("Danach wäre von der Strecke nichts mehr übrig")
+        db().execute("UPDATE strecken SET punkte=?, start=?, ende=?, status='wartet', ziel_lat=NULL, ziel_lon=NULL, "
+                     "start_lat=NULL, start_lon=NULL WHERE id=?", (json.dumps(alle), alle[0][2], alle[-1][2], sid))
+        db().commit()
+
+    if daten.get("kuerzen") in ("vorne", "hinten", "mitte"):
+        zeit = float(daten.get("zeit", 0))
+        bis = float(daten.get("bis", zeit))
+        if daten["kuerzen"] == "vorne":
+            behalten = lambda t: t >= zeit
+        elif daten["kuerzen"] == "hinten":
+            behalten = lambda t: t <= zeit
+        else:
+            von, bis = min(zeit, bis), max(zeit, bis)
+            behalten = lambda t: t <= von or t >= bis
+        alle = [q for q in punkte if behalten(q[2])]
+        weg = [q for q in punkte if not behalten(q[2])]
+        if not daten.get("vorschau"):
+            speichern(alle)
+        return {"form": [q[:2] for q in weg], "laenge": laenge(weg), "namen": [], "punkte": alle}
+
+    wo = "ende" if daten.get("wo") == "ende" else "anfang"
+    tipps = [[float(q[0]), float(q[1])] for q in daten.get("punkte", [])][:25]
     if not punkte or not tipps:
         return {"form": [], "laenge": 0, "namen": []}
-    wege = tipps + [punkte[0][:2]] if wo == "anfang" else [punkte[-1][:2]] + tipps
-    orte = [{"lat": a, "lon": b, "type": "break" if i in (0, len(wege) - 1) else "via"} for i, (a, b) in enumerate(wege)]
-    req = urllib.request.Request(VALHALLA + "/route", data=json.dumps(
-        {"locations": orte, "costing": PROFIL.get(z["art"], "auto"), "directions_type": "maneuvers",
-         "language": "de-DE"}).encode(), headers={"Content-Type": "application/json"})
+    # Ein paar echte Aufzeichnungspunkte mitgeben, damit der Übergang natürlich wird
+    anschluss = [q[:2] for q in (punkte[:6] if wo == "anfang" else punkte[-6:])]
+    kette = tipps + anschluss if wo == "anfang" else anschluss + tipps
+    anker = punkte[0][:2] if wo == "anfang" else punkte[-1][:2]
+    req = urllib.request.Request(VALHALLA + "/trace_route", data=json.dumps(
+        {"shape": [{"lat": a, "lon": b} for a, b in kette], "costing": PROFIL.get(z["art"], "auto"),
+         "shape_match": "map_snap", "directions_type": "maneuvers", "language": "de-DE",
+         "trace_options": {"search_radius": 50, "gps_accuracy": 25, "breakage_distance": 5000}}).encode(),
+        headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             antwort = json.loads(r.read())
     except urllib.error.HTTPError:
         raise RuntimeError("Zwischen diesen Punkten findet Valhalla keinen Weg") from None
-    form, namen = [], []
+    voll, namen = [], []
     for leg in antwort.get("trip", {}).get("legs", []):
         for mv in leg.get("maneuvers", []):
             for n in mv.get("street_names", []):
                 if not namen or namen[-1] != n:
                     namen.append(n)
         stueck = dekodieren(leg.get("shape", ""))
-        form += stueck if not form else stueck[1:]
+        voll += stueck if not voll else stueck[1:]
+    if len(voll) < 2:
+        return {"form": [], "laenge": 0, "namen": []}
+    # Nur das neue Stück: bis zum (bzw. ab dem) Punkt, der dem Anschluss am nächsten liegt
+    i = min(range(len(voll)), key=lambda k: abstand(voll[k], anker))
+    form = voll[:i + 1] if wo == "anfang" else voll[i:]
     meter = laenge(form)
     if daten.get("vorschau") or len(form) < 2:
         return {"form": form, "laenge": meter, "namen": namen}
 
-    # Zeiten passend zur Aufnahme vergeben (~25 km/h), dann anhängen
     neu = []
     if wo == "anfang":
         t = punkte[0][2]
-        for i in range(len(form) - 1, 0, -1):
-            t -= abstand(form[i - 1], form[i]) / 7.0
-            neu.insert(0, [form[i - 1][0], form[i - 1][1], t])
+        for k in range(len(form) - 1, 0, -1):
+            t -= abstand(form[k - 1], form[k]) / 7.0
+            neu.insert(0, [form[k - 1][0], form[k - 1][1], t])
         alle = neu + punkte
     else:
         t = punkte[-1][2]
-        for i in range(1, len(form)):
-            t += abstand(form[i - 1], form[i]) / 7.0
-            neu.append([form[i][0], form[i][1], t])
+        for k in range(1, len(form)):
+            t += abstand(form[k - 1], form[k]) / 7.0
+            neu.append([form[k][0], form[k][1], t])
         alle = punkte + neu
-    db().execute("UPDATE strecken SET punkte=?, start=?, ende=?, status='wartet', ziel_lat=NULL, ziel_lon=NULL, "
-                 "start_lat=NULL, start_lon=NULL WHERE id=?", (json.dumps(alle), alle[0][2], alle[-1][2], sid))
-    db().commit()
+    speichern(alle)
     return {"form": form, "laenge": meter, "namen": namen, "punkte": alle}
 
 

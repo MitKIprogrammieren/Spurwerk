@@ -1,8 +1,8 @@
 import SwiftUI
 import MapKit
 
-/// Fehlendes Stück am Anfang oder Ende einer Strecke selbst einzeichnen:
-/// Punkte entlang des echten Wegs antippen, der NUC legt die Straße dazwischen.
+/// Fehlendes Stück am Anfang oder Ende einer Strecke selbst einzeichnen
+/// (Punkte antippen, der NUC legt die Straße dazwischen) oder falsche Teile löschen.
 struct StreckeKorrigierenView: View {
     let fahrt: Fahrt
     @Environment(\.dismiss) private var dismiss
@@ -20,6 +20,12 @@ struct StreckeKorrigierenView: View {
     @State private var server: URL?
     @State private var anfrageNr = 0
     @State private var position: MapCameraPosition = .automatic
+    // Löschen-Modus
+    @State private var markA: Int?
+    @State private var markB: Int?
+    @State private var schnitt: String?   // "vorne", "hinten", "mitte"
+
+    private var loeschen: Bool { wo == "loeschen" }
 
     private var linie: [CLLocationCoordinate2D] {
         if let s = fahrt.spur, s.count > 1 { return s }
@@ -27,7 +33,68 @@ struct StreckeKorrigierenView: View {
     }
 
     /// Wo das neue Stück an die Strecke anschließt
-    private var anker: CLLocationCoordinate2D? { wo == "anfang" ? linie.first : linie.last }
+    private var anker: CLLocationCoordinate2D? {
+        loeschen ? nil : (wo == "anfang" ? linie.first : linie.last)
+    }
+
+    private func koord(_ i: Int) -> CLLocationCoordinate2D {
+        CLLocationCoordinate2D(latitude: fahrt.punkte[i].lat, longitude: fahrt.punkte[i].lon)
+    }
+
+    /// Bleibt der Punkt mit dieser Zeit stehen? (gleiche Regel wie auf dem NUC)
+    private func behalten(_ t: Double) -> Bool {
+        guard let schnitt, let a = markA else { return true }
+        let ta = fahrt.punkte[a].zeit
+        switch schnitt {
+        case "vorne": return t >= ta
+        case "hinten": return t <= ta
+        default:
+            guard let b = markB else { return true }
+            let tb = fahrt.punkte[b].zeit
+            return t <= min(ta, tb) || t >= max(ta, tb)
+        }
+    }
+
+    /// Die Teile, die gelöscht würden (zusammenhängende Stücke, rot angezeigt)
+    private var wegStuecke: [[CLLocationCoordinate2D]] {
+        guard schnitt != nil else { return [] }
+        var stuecke: [[CLLocationCoordinate2D]] = []
+        var aktuell: [CLLocationCoordinate2D] = []
+        for (i, p) in fahrt.punkte.enumerated() {
+            if !behalten(p.zeit) {
+                if aktuell.isEmpty, i > 0 { aktuell.append(koord(i - 1)) }
+                aktuell.append(koord(i))
+            } else if !aktuell.isEmpty {
+                aktuell.append(koord(i))
+                stuecke.append(aktuell); aktuell = []
+            }
+        }
+        if aktuell.count > 1 { stuecke.append(aktuell) }
+        return stuecke
+    }
+
+    private var wegLaenge: Double {
+        wegStuecke.reduce(0) { summe, st in
+            summe + zip(st, st.dropFirst()).reduce(0) {
+                $0 + CLLocation(latitude: $1.0.latitude, longitude: $1.0.longitude)
+                    .distance(from: CLLocation(latitude: $1.1.latitude, longitude: $1.1.longitude))
+            }
+        }
+    }
+
+    private var wegAnzahl: Int { fahrt.punkte.filter { !behalten($0.zeit) }.count }
+
+    /// Nächster aufgezeichneter Punkt zur angetippten Stelle
+    private func naechster(_ c: CLLocationCoordinate2D) -> Int? {
+        guard !fahrt.punkte.isEmpty else { return nil }
+        let k = cos(c.latitude * .pi / 180)
+        var best = 0, bestD = Double.infinity
+        for (i, p) in fahrt.punkte.enumerated() {
+            let d = pow(p.lat - c.latitude, 2) + pow((p.lon - c.longitude) * k, 2)
+            if d < bestD { bestD = d; best = i }
+        }
+        return best
+    }
 
     var body: some View {
         NavigationStack {
@@ -35,6 +102,7 @@ struct StreckeKorrigierenView: View {
                 Picker("Wo fehlt etwas?", selection: $wo) {
                     Text("Anfang ergänzen").tag("anfang")
                     Text("Ende ergänzen").tag("ende")
+                    Text("Löschen").tag("loeschen")
                 }
                 .pickerStyle(.segmented)
                 .padding(.horizontal)
@@ -49,6 +117,19 @@ struct StreckeKorrigierenView: View {
                         if form.count > 1 {
                             MapPolyline(coordinates: form)
                                 .stroke(Color.orange, style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round, dash: [8, 6]))
+                        }
+                        ForEach(Array(wegStuecke.enumerated()), id: \.offset) { _, st in
+                            MapPolyline(coordinates: st)
+                                .stroke(Color.red, style: StrokeStyle(lineWidth: 7, lineCap: .round, lineJoin: .round, dash: [9, 6]))
+                        }
+                        ForEach(Array([markA, markB].compactMap { $0 }.enumerated()), id: \.offset) { n, i in
+                            Annotation("", coordinate: koord(i)) {
+                                Text(n == 0 ? "A" : "B")
+                                    .font(.caption.weight(.bold))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 24, height: 24)
+                                    .background(Circle().fill(Color.black.opacity(0.8)))
+                            }
                         }
                         if let anker {
                             Annotation("", coordinate: anker) {
@@ -68,12 +149,25 @@ struct StreckeKorrigierenView: View {
                     }
                     .mapStyle(.standard(pointsOfInterest: .excludingAll))
                     .onTapGesture { stelle in
-                        guard let c = proxy.convert(stelle, from: .local), tipps.count < 25 else { return }
+                        guard let c = proxy.convert(stelle, from: .local) else { return }
+                        if loeschen {
+                            guard let i = naechster(c) else { return }
+                            if markA == nil || markB != nil {
+                                markA = i; markB = nil; schnitt = nil
+                            } else if i != markA {
+                                markB = i; schnitt = "mitte"
+                            }
+                            fehler = nil
+                            return
+                        }
+                        guard tipps.count < 25 else { return }
                         tipps.append(c)
                         vorschau()
                     }
                     .overlay(alignment: .top) {
-                        Text(wo == "anfang"
+                        Text(loeschen
+                             ? "Tippe 1 oder 2 Stellen auf der Linie"
+                             : wo == "anfang"
                              ? "Tippe deinen Weg vom Start bis zur Linie"
                              : "Tippe deinen Weg von der Linie bis zum Ziel")
                             .font(.footnote)
@@ -84,6 +178,9 @@ struct StreckeKorrigierenView: View {
                     }
                 }
 
+                if loeschen {
+                    loeschenLeiste
+                } else {
                 HStack(alignment: .center) {
                     VStack(alignment: .leading, spacing: 2) {
                         if let fehler {
@@ -109,6 +206,7 @@ struct StreckeKorrigierenView: View {
                     .disabled(tipps.isEmpty)
                 }
                 .padding()
+                }
             }
             .navigationTitle("Strecke korrigieren")
             .navigationBarTitleDisplayMode(.inline)
@@ -121,12 +219,13 @@ struct StreckeKorrigierenView: View {
                         ProgressView()
                     } else {
                         Button("Fertig") { uebernehmen() }
-                            .disabled(form.count < 2 || rechnet || server == nil)
+                            .disabled(loeschen ? (schnitt == nil || server == nil) : (form.count < 2 || rechnet || server == nil))
                     }
                 }
             }
             .onChange(of: wo) { _, _ in
                 tipps = []
+                markA = nil; markB = nil; schnitt = nil
                 vorschau()
             }
             .task {
@@ -134,6 +233,57 @@ struct StreckeKorrigierenView: View {
                 if server == nil { fehler = "NUC nicht erreichbar – Tailscale an?" }
             }
         }
+    }
+
+    private var loeschenLeiste: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let fehler {
+                Text(fehler).font(.footnote).foregroundStyle(.red)
+            } else if markA == nil {
+                Text("Tippe auf die Stelle, wo es falsch wird").font(.subheadline.weight(.medium))
+            } else if schnitt == nil {
+                Text("Was soll weg? Oder tippe eine zweite Stelle (B) an").font(.subheadline.weight(.medium))
+            } else {
+                Text("Wird gelöscht: \(Format.km(wegLaenge)) · \(wegAnzahl) Punkte")
+                    .font(.subheadline.weight(.medium)).foregroundStyle(.red)
+            }
+            if markA != nil {
+                HStack(spacing: 8) {
+                    if markB == nil {
+                        wahl("Davor löschen", "vorne")
+                        wahl("Danach löschen", "hinten")
+                    } else {
+                        wahl("Zwischen A und B löschen", "mitte")
+                    }
+                    Button {
+                        markA = nil; markB = nil; schnitt = nil
+                    } label: {
+                        Image(systemName: "arrow.uturn.backward")
+                            .padding(8)
+                            .background(Circle().strokeBorder(Color.secondary.opacity(0.5)))
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding()
+    }
+
+    private func wahl(_ titel: String, _ art: String) -> some View {
+        Button {
+            schnitt = schnitt == art ? nil : art
+        } label: {
+            Text(titel)
+                .font(.subheadline.weight(.medium))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 9)
+                .background(RoundedRectangle(cornerRadius: 10)
+                    .fill(schnitt == art ? Color.red.opacity(0.18) : Color(.secondarySystemBackground)))
+                .overlay(RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(schnitt == art ? Color.red : Color.clear))
+                .foregroundStyle(schnitt == art ? Color.red : Color.primary)
+        }
+        .buttonStyle(.plain)
     }
 
     private func anfrage(vorschau: Bool) -> [String: Any] {
@@ -171,7 +321,38 @@ struct StreckeKorrigierenView: View {
         }
     }
 
+    private func kuerzen() {
+        guard let server, let schnitt, let a = markA else { return }
+        var inhalt: [String: Any] = ["id": fahrt.id.uuidString, "kuerzen": schnitt, "zeit": fahrt.punkte[a].zeit]
+        if let b = markB { inhalt["bis"] = fahrt.punkte[b].zeit }
+        let bleiben = fahrt.punkte.filter { behalten($0.zeit) }
+        guard bleiben.count >= 2 else {
+            fehler = "Danach wäre von der Strecke nichts mehr übrig"
+            return
+        }
+        let weg = wegLaenge
+        speichert = true
+        Task {
+            do {
+                _ = try await SyncArbeiter.senden(inhalt, an: server.appendingPathComponent("api/korrigieren"))
+                fahrt.punkte = bleiben
+                if let erster = bleiben.first { fahrt.start = Date(timeIntervalSince1970: erster.zeit) }
+                if let letzter = bleiben.last { fahrt.ende = Date(timeIntervalSince1970: letzter.zeit) }
+                fahrt.distanzMeter = max(0, fahrt.distanzMeter - weg)
+                fahrt.status = .wartet
+                fahrt.mussHoch = false   // der NUC hat schon gekürzt
+                try? context.save()
+                abgleich.geaendert()
+                dismiss()
+            } catch {
+                fehler = error.localizedDescription
+                speichert = false
+            }
+        }
+    }
+
     private func uebernehmen() {
+        if loeschen { kuerzen(); return }
         guard let server else { return }
         let inhalt = anfrage(vorschau: false)
         speichert = true
