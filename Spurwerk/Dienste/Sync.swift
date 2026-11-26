@@ -74,7 +74,24 @@ actor SyncArbeiter {
                 guard let text = e["id"] as? String, let uuid = UUID(uuidString: text) else { continue }
                 var suche = FetchDescriptor<Fahrt>(predicate: #Predicate { $0.id == uuid })
                 suche.fetchLimit = 1
-                guard let f = try modelContext.fetch(suche).first else { continue }
+                var gefunden = try modelContext.fetch(suche).first
+                // Auf dem NUC von Hand nachgetragene Strecke: hier neu anlegen
+                if gefunden == nil, (e["quelle"] as? String) == "hand",
+                   let liste = e["punkte"] as? [[Double]], let start = e["start"] as? Double {
+                    let neu = Fahrt(start: Date(timeIntervalSince1970: start),
+                                    art: FahrtArt(rawValue: e["art"] as? String ?? "") ?? .fuss)
+                    neu.id = uuid
+                    neu.quelle = "hand"
+                    neu.punkte = liste.filter { $0.count >= 3 }
+                        .map { Punkt(lat: $0[0], lon: $0[1], zeit: $0[2], genauigkeit: 10, tempo: -1) }
+                    neu.ende = (e["ende"] as? Double).map { Date(timeIntervalSince1970: $0) }
+                    neu.distanzMeter = e["distanz"] as? Double ?? 0
+                    neu.status = .wartet
+                    neu.mussHoch = false
+                    modelContext.insert(neu)
+                    gefunden = neu
+                }
+                guard let f = gefunden else { continue }
                 if f.mussHoch { continue }                 // hier geändert, aber noch nicht hochgeladen
                 let fertig = (e["status"] as? String) == "fertig"
                 // Auch schon fertige Strecken übernehmen: der NUC kann sie verbessert neu berechnet haben

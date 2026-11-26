@@ -104,7 +104,7 @@ struct Halt: Identifiable, Hashable, Sendable {
                 let ende = p.bis ?? .distantFuture
                 let hEnde = h.bis ?? h.von
                 if ende >= hEnde.addingTimeInterval(-60),
-                   meter(p.lat, p.lon, h.lat, h.lon) <= 300 {
+                   meter(p.lat, p.lon, h.lat, h.lon) <= 100 {
                     return false
                 }
             }

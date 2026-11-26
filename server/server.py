@@ -516,7 +516,7 @@ def halte_alle():
     def doppelt(h):
         k = bisect.bisect_right(vons, h["von"])
         for p in parken[max(0, k - 3):k]:
-            if (p["bis"] is None or p["bis"] >= h["bis"] - 60) and abstand((p["lat"], p["lon"]), (h["lat"], h["lon"])) <= 300:
+            if (p["bis"] is None or p["bis"] >= h["bis"] - 60) and abstand((p["lat"], p["lon"]), (h["lat"], h["lon"])) <= 100:
                 return True
         return False
     return [h for h in halte if h["p"] or not doppelt(h)]
@@ -598,10 +598,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"halte": out[-3000:]})
             if url.path == "/api/abholen":
                 seit = float(q.get("seit", ["0"])[0] or 0)
-                zeilen = db().execute("SELECT id, status, fehler, spur, geaendert FROM strecken WHERE geaendert > ? AND status IN ('fertig','fehler') ORDER BY geaendert LIMIT 500",
+                zeilen = db().execute("SELECT id, art, start, ende, distanz, quelle, punkte, status, fehler, spur, geaendert FROM strecken "
+                                      "WHERE geaendert > ? AND status IN ('fertig','fehler') ORDER BY geaendert LIMIT 500",
                                       (seit,)).fetchall()
-                return self._send(200, {"strecken": [{"id": z["id"], "status": z["status"], "fehler": z["fehler"],
-                                                      "spur": z["spur"], "geaendert": z["geaendert"]} for z in zeilen]})
+                def eintrag(z):
+                    e = {"id": z["id"], "status": z["status"], "fehler": z["fehler"], "spur": z["spur"], "geaendert": z["geaendert"]}
+                    if z["quelle"] == "hand":   # von Hand nachgetragen – das iPhone kennt sie noch nicht
+                        e.update(art=z["art"], start=z["start"], ende=z["ende"], distanz=z["distanz"], quelle="hand",
+                                 punkte=json.loads(z["punkte"] or "[]"))
+                    return e
+                return self._send(200, {"strecken": [eintrag(z) for z in zeilen]})
             if url.path == "/api/bekannt":
                 return self._send(200, {"ids": [z[0] for z in db().execute("SELECT id FROM strecken")]})
             return self._send(404, {"error": "Unbekannt"})
