@@ -36,6 +36,8 @@ final class FahrtRecorder: NSObject, ObservableObject {
     private var probeBis: Date?
     private var probePunkte: [Punkt] = []
     private var letzteProbePruefung = Date.distantPast
+    /// Mitte des Zauns, den wir zuletzt verlassen haben (Auto oder Ende eines Fußwegs)
+    private var zaunMitte: CLLocation?
 
     // MARK: - Einstellungen
 
@@ -92,7 +94,7 @@ final class FahrtRecorder: NSObject, ObservableObject {
         }
         let fahrt = Fahrt(start: Date(), art: art)
         // Was seit dem Verlassen des Parkplatzes schon mitgeschrieben wurde, gehört zur Fahrt
-        let vorlauf = art == .auto ? probePunkte : []
+        let vorlauf = art == .rad ? [] : probePunkte
         if let erster = vorlauf.first { fahrt.start = Date(timeIntervalSince1970: erster.zeit) }
         probeBis = nil
         probePunkte = []
@@ -165,7 +167,12 @@ final class FahrtRecorder: NSObject, ObservableObject {
             fahrt.status = .wartet
             fahrt.dichte = mittlererAbstand(punkte)
             fahrt.mussHoch = true
-            if fahrt.art == .auto, let p = punkte.last { parkZaunSetzen(lat: p.lat, lon: p.lon) }
+            if let p = punkte.last {
+                // Auto: Zaun um den Parkplatz. Fußweg: Zaun um den Ort, an dem du jetzt bist
+                // (Café, Imbiss …), damit auch der Rückweg aufgenommen wird.
+                if fahrt.art == .auto { parkZaunSetzen(lat: p.lat, lon: p.lon, id: "parkplatz") }
+                if fahrt.art == .fuss { parkZaunSetzen(lat: p.lat, lon: p.lon, id: "halt") }
+            }
         }
         try? context.save()
         livePunkte = []
@@ -300,20 +307,22 @@ final class FahrtRecorder: NSObject, ObservableObject {
 
     // MARK: - Parkplatz-Zaun
 
-    /// Unsichtbarer Zaun (100 m) um das geparkte Auto. Fährst du los, weckt iOS die App beim
-    /// Verlassen des Zauns – deutlich früher als die stromsparende Ortung (erst nach ~500 m).
-    private func parkZaunSetzen(lat: Double, lon: Double) {
-        for r in manager.monitoredRegions where r.identifier == "parkplatz" { manager.stopMonitoring(for: r) }
-        guard automatikAuto, CLLocationManager.isMonitoringAvailable(for: CLCircularRegion.self) else { return }
+    /// Unsichtbarer Zaun (50 m) um das geparkte Auto bzw. das Ende eines Fußwegs. Gehst oder fährst du los,
+    /// weckt iOS die App beim Verlassen des Zauns – deutlich früher als die stromsparende Ortung (~500 m).
+    /// iOS löst kleine Zäune oft erst nach ~100 m aus; die genaue Prüfung macht danach das GPS.
+    private func parkZaunSetzen(lat: Double, lon: Double, id: String) {
+        for r in manager.monitoredRegions where r.identifier == id { manager.stopMonitoring(for: r) }
+        guard automatik, CLLocationManager.isMonitoringAvailable(for: CLCircularRegion.self) else { return }
         let zaun = CLCircularRegion(center: CLLocationCoordinate2D(latitude: lat, longitude: lon),
-                                    radius: 100, identifier: "parkplatz")
+                                    radius: 50, identifier: id)
         zaun.notifyOnEntry = false
         zaun.notifyOnExit = true
         manager.startMonitoring(for: zaun)
     }
 
-    fileprivate func parkZaunVerlassen() {
-        guard automatikAuto, !nimmtAuf else { return }
+    fileprivate func parkZaunVerlassen(_ mitte: CLLocationCoordinate2D) {
+        guard automatik, !nimmtAuf else { return }
+        zaunMitte = CLLocation(latitude: mitte.latitude, longitude: mitte.longitude)
         // Bis zu 2,5 Minuten GPS mitschreiben; fahren wir, beginnt die Fahrt mit diesen Punkten.
         probeBis = Date().addingTimeInterval(150)
         probePunkte = []
@@ -374,6 +383,13 @@ final class FahrtRecorder: NSObject, ObservableObject {
                                              zeit: ort.timestamp.timeIntervalSince1970,
                                              genauigkeit: ort.horizontalAccuracy, tempo: ort.speed))
                 }
+                // Zu Fuß losgegangen? Mehr als 70 m vom Zaun weg, aber langsam → Fußweg mit diesen Punkten
+                if automatikFuss, let mitte = zaunMitte, let letzter = orte.last,
+                   letzter.horizontalAccuracy > 0, letzter.horizontalAccuracy < 30,
+                   letzter.distance(from: mitte) > 70, letzter.speed >= 0, letzter.speed < 2.5 {
+                    starten(.fuss, automatisch: true)
+                    return
+                }
                 // Nicht bei jedem Punkt nachfragen – alle 15 s reicht
                 if let letzter = orte.last, letzter.speed > 8 || Date().timeIntervalSince(letzteProbePruefung) > 15 {
                     letzteProbePruefung = Date()
@@ -423,7 +439,9 @@ extension FahrtRecorder: CLLocationManagerDelegate {
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {}
 
     nonisolated func locationManager(_ manager: CLLocationManager, didExitRegion region: CLRegion) {
-        guard region.identifier == "parkplatz" else { return }
-        Task { @MainActor in self.parkZaunVerlassen() }
+        guard region.identifier == "parkplatz" || region.identifier == "halt",
+              let kreis = region as? CLCircularRegion else { return }
+        let mitte = kreis.center
+        Task { @MainActor in self.parkZaunVerlassen(mitte) }
     }
 }
