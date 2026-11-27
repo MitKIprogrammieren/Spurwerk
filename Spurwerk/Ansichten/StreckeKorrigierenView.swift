@@ -26,6 +26,7 @@ struct StreckeKorrigierenView: View {
     @State private var schnitt: String?   // "vorne", "hinten", "mitte"
 
     private var loeschen: Bool { wo == "loeschen" }
+    private var neuZeichnen: Bool { wo == "neu" }
 
     private var linie: [CLLocationCoordinate2D] {
         if let s = fahrt.spur, s.count > 1 { return s }
@@ -34,7 +35,7 @@ struct StreckeKorrigierenView: View {
 
     /// Wo das neue Stück an die Strecke anschließt
     private var anker: CLLocationCoordinate2D? {
-        loeschen ? nil : (wo == "anfang" ? linie.first : linie.last)
+        loeschen || neuZeichnen ? nil : (wo == "anfang" ? linie.first : linie.last)
     }
 
     private func koord(_ i: Int) -> CLLocationCoordinate2D {
@@ -100,8 +101,9 @@ struct StreckeKorrigierenView: View {
         NavigationStack {
             VStack(spacing: 0) {
                 Picker("Wo fehlt etwas?", selection: $wo) {
-                    Text("Anfang ergänzen").tag("anfang")
-                    Text("Ende ergänzen").tag("ende")
+                    Text("Anfang +").tag("anfang")
+                    Text("Ende +").tag("ende")
+                    Text("Neu").tag("neu")
                     Text("Löschen").tag("loeschen")
                 }
                 .pickerStyle(.segmented)
@@ -112,7 +114,7 @@ struct StreckeKorrigierenView: View {
                     Map(position: $position) {
                         if linie.count > 1 {
                             MapPolyline(coordinates: linie)
-                                .stroke(fahrt.art.farbe, style: StrokeStyle(lineWidth: 5, lineCap: .round, lineJoin: .round))
+                                .stroke(fahrt.art.farbe.opacity(neuZeichnen ? 0.35 : 1), style: StrokeStyle(lineWidth: 5, lineCap: .round, lineJoin: .round))
                         }
                         if form.count > 1 {
                             MapPolyline(coordinates: form)
@@ -160,13 +162,16 @@ struct StreckeKorrigierenView: View {
                             fehler = nil
                             return
                         }
-                        guard tipps.count < 25 else { return }
+                        guard tipps.count < (neuZeichnen ? 80 : 25) else { return }
                         tipps.append(c)
                         vorschau()
                     }
                     .overlay(alignment: .top) {
                         Text(loeschen
                              ? "Tippe 1 oder 2 Stellen auf der Linie"
+                             : neuZeichnen
+                             ? (fahrt.art == .fuss ? "Tippe deinen ganzen Weg – wird genau so übernommen"
+                                                   : "Tippe deinen ganzen Weg auf die Straßen, Start bis Ziel")
                              : wo == "anfang"
                              ? "Tippe deinen Weg vom Start bis zur Linie"
                              : "Tippe deinen Weg von der Linie bis zum Ziel")
@@ -287,7 +292,10 @@ struct StreckeKorrigierenView: View {
     }
 
     private func anfrage(vorschau: Bool) -> [String: Any] {
-        ["id": fahrt.id.uuidString, "wo": wo,
+        if neuZeichnen {
+            return ["id": fahrt.id.uuidString, "neu": tipps.map { [$0.latitude, $0.longitude] }, "vorschau": vorschau]
+        }
+        return ["id": fahrt.id.uuidString, "wo": wo,
          "punkte": tipps.map { [$0.latitude, $0.longitude] }, "vorschau": vorschau]
     }
 
@@ -360,6 +368,25 @@ struct StreckeKorrigierenView: View {
             do {
                 let r = try await SyncArbeiter.senden(inhalt, an: server.appendingPathComponent("api/korrigieren"))
                 let alle = (r["punkte"] as? [[Double]]) ?? []
+                if neuZeichnen {
+                    // Ganze Strecke ersetzt – der NUC hat die Linie schon fertig
+                    let neu = alle.filter { $0.count > 2 }
+                        .map { Punkt(lat: $0[0], lon: $0[1], zeit: $0[2], genauigkeit: 10, tempo: -1) }
+                    guard neu.count > 1 else { throw SyncArbeiter.Fehler(text: "Zu wenige Punkte") }
+                    fahrt.punkte = neu
+                    fahrt.spur = Self.koordinaten(r["form"])
+                    fahrt.spurVersion += 1
+                    fahrt.start = Date(timeIntervalSince1970: neu[0].zeit)
+                    fahrt.ende = Date(timeIntervalSince1970: neu[neu.count - 1].zeit)
+                    fahrt.distanzMeter = r["laenge"] as? Double ?? fahrt.distanzMeter
+                    fahrt.status = .fertig
+                    fahrt.fehlertext = nil
+                    fahrt.mussHoch = false
+                    try? context.save()
+                    abgleich.geaendert()
+                    dismiss()
+                    return
+                }
                 let alt = fahrt.punkte
                 let zusatz = max(0, alle.count - alt.count)
                 func punkt(_ q: [Double]) -> Punkt {

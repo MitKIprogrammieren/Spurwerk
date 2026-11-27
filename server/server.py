@@ -249,13 +249,13 @@ def abgleichen(punkte, art):
     return ergebnis, luecke
 
 
-def routen(teil, art):
+def routen(teil, art, radius=50):
     """Weg zwischen lückenhaften Punkten über /route (max. 20 Punkte pro Anfrage)."""
     linie, start = [], 0
     while start < len(teil) - 1:
         ende = min(start + 20, len(teil))
         stueck = teil[start:ende]
-        orte = [{"lat": p[0], "lon": p[1], "radius": 50,
+        orte = [{"lat": p[0], "lon": p[1], "radius": radius,
                  "type": "break" if i in (0, len(stueck) - 1) else "through"} for i, p in enumerate(stueck)]
         l = valhalla("/route", {"locations": orte, "costing": PROFIL.get(art, "auto"), "directions_type": "none"}, 60)[0]
         if linie and l:
@@ -336,6 +336,28 @@ def korrigieren(daten):
         if not daten.get("vorschau"):
             speichern(alle)
         return {"form": [q[:2] for q in weg], "laenge": laenge(weg), "namen": [], "punkte": alle}
+
+    if daten.get("neu") is not None:
+        # Ganze Strecke neu eingezeichnet. Auto/Rad: Valhalla fährt die angetippten Punkte der Reihe nach ab.
+        # Zu Fuß: genau wie gezeichnet – Wege zwischen Häusern fehlen oft in der Karte.
+        tipps = [[float(q[0]), float(q[1])] for q in daten["neu"]][:80]
+        if len(tipps) < 2:
+            return {"form": tipps, "laenge": 0, "namen": []}
+        form = tipps if z["art"] == "fuss" else routen(tipps, z["art"], 20)
+        meter = laenge(form)
+        if daten.get("vorschau"):
+            return {"form": form, "laenge": meter, "namen": []}
+        t0 = punkte[0][2] if punkte else time.time()
+        t1 = punkte[-1][2] if len(punkte) > 1 else t0 + meter / 8
+        alle, acc = [], 0.0
+        for k, p in enumerate(form):
+            if k:
+                acc += abstand(form[k - 1], p)
+            alle.append([p[0], p[1], t0 + (t1 - t0) * acc / max(meter, 1)])
+        db().execute("UPDATE strecken SET punkte=?, start=?, ende=?, distanz=?, ziel_lat=NULL, ziel_lon=NULL, "
+                     "start_lat=NULL, start_lon=NULL WHERE id=?", (json.dumps(alle), t0, t1, meter, sid))
+        speichere_spur(sid, [(p[0], p[1]) for p in form])
+        return {"form": form, "laenge": meter, "namen": [], "punkte": alle}
 
     wo = "ende" if daten.get("wo") == "ende" else "anfang"
     tipps = [[float(q[0]), float(q[1])] for q in daten.get("punkte", [])][:25]
