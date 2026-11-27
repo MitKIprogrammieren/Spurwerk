@@ -38,6 +38,8 @@ final class FahrtRecorder: NSObject, ObservableObject {
     private var letzteProbePruefung = Date.distantPast
     /// Mitte des Zauns, den wir zuletzt verlassen haben (Auto oder Ende eines Fußwegs)
     private var zaunMitte: CLLocation?
+    /// Wie viele GPS-Punkte hintereinander bei einem Fußweg schon Autotempo hatten
+    private var schnellePunkte = 0
 
     // MARK: - Einstellungen
 
@@ -115,6 +117,7 @@ final class FahrtRecorder: NSObject, ObservableObject {
         letzteBewegung = Date()
         gehenSeit = nil
         automatischGestartet = automatisch
+        schnellePunkte = 0
         nimmtAuf = true
 
         switch art {
@@ -292,7 +295,7 @@ final class FahrtRecorder: NSObject, ObservableObject {
             gehenSeit = nil
             if nimmtAuf && art == .auto { letzteBewegung = Date() }
             // Vom Fußweg ins Auto gestiegen → Fußweg beenden, Autofahrt starten
-            if nimmtAuf && art == .fuss && automatischGestartet { beenden() }
+            if nimmtAuf && art == .fuss && automatischGestartet { umsteigenAufAuto(); return }
             if !nimmtAuf && automatikAuto { starten(.auto, automatisch: true) }
         } else if (a.walking || a.running) && sicher {
             if gehenSeit == nil { gehenSeit = Date() }
@@ -417,8 +420,37 @@ final class FahrtRecorder: NSObject, ObservableObject {
                                 genauigkeit: ort.horizontalAccuracy,
                                 tempo: ort.speed))
             livePunkte.append(ort.coordinate)
+            // Zu Fuß losgegangen und dann ins Auto gestiegen: Das iPhone meldet „im Auto“ nicht immer.
+            // Mehrere Punkte über 25 km/h → Fußweg hier beenden, ab da Autofahrt.
+            if art == .fuss && automatischGestartet {
+                schnellePunkte = ort.speed > 7 ? schnellePunkte + 1 : 0
+                if schnellePunkte >= 4 {
+                    umsteigenAufAuto()
+                    return
+                }
+            }
         }
         if Date().timeIntervalSince(letztesSpeichern) > 30 { zwischenspeichern() }
+    }
+
+    /// Teilt die laufende Fußweg-Aufnahme: alles bis zum letzten langsamen Punkt bleibt Fußweg,
+    /// der Rest wird der Anfang einer neuen Autofahrt.
+    private func umsteigenAufAuto() {
+        schnellePunkte = 0
+        // letzter Punkt, an dem man noch ging (unter ~11 km/h)
+        var teil = punkte.count
+        while teil > 0, punkte[teil - 1].tempo > 3 { teil -= 1 }
+        let autoAnfang = Array(punkte[max(0, teil - 1)...])
+        punkte = Array(punkte[..<teil])
+        liveDistanz = 0
+        for i in punkte.indices.dropFirst() {
+            liveDistanz += CLLocation(latitude: punkte[i - 1].lat, longitude: punkte[i - 1].lon)
+                .distance(from: CLLocation(latitude: punkte[i].lat, longitude: punkte[i].lon))
+        }
+        beenden()
+        guard automatikAuto else { return }
+        probePunkte = autoAnfang
+        starten(.auto, automatisch: true)
     }
 
     fileprivate func berechtigungGeaendert() {
